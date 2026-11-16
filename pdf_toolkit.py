@@ -2,9 +2,11 @@
 """
 PDF Toolkit - a cross-platform (Windows / macOS / Linux) desktop app for the
 PDF jobs websites charge for: merge, reorder, rotate, delete, crop and extract
-pages, split, compress, convert images to PDF and pages to images, fill in
-forms and sign, add page numbers, headers and footers, Bates numbers or a
-watermark, and add or remove a password. Everything stays on your computer.
+pages, split, compress, convert images to PDF and pages to images, view and
+search, comment and mark up, fill in forms and sign (including certificate
+signatures), create fillable forms, compare two PDFs, add page numbers,
+headers and footers, Bates numbers or a watermark, and add or remove a
+password. Everything stays on your computer.
 
 Pages are shown as thumbnails in one workspace: open PDFs and images, arrange
 the pages, then save. Compression, page numbers, watermark and password are
@@ -15,9 +17,10 @@ Requirements:
     pikepdf     -> reads, edits and writes PDFs (qpdf)
     pypdfium2   -> draws the page thumbnails and exports pages as images (PDFium)
     Pillow, pillow-heif -> images (pillow-heif opens iPhone HEIC photos)
+    pyhanko     -> certificate (digital) signatures
     tkinterdnd2 -> drag and drop from other apps (optional: the app works without it)
     The app offers to install them on first run. Manual install, using the Python that runs the app:
-        python -m pip install pikepdf pypdfium2 pillow pillow-heif tkinterdnd2
+        python -m pip install pikepdf pypdfium2 pillow pillow-heif pyhanko tkinterdnd2
 
 Run:
     python pdf_toolkit.py
@@ -39,7 +42,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 # install them) when they're missing.
 pikepdf = pdfium = Image = ImageOps = ImageTk = None
 
-PACKAGES = ["pikepdf", "pypdfium2", "pillow", "pillow-heif", "tkinterdnd2"]
+PACKAGES = ["pikepdf", "pypdfium2", "pillow", "pillow-heif", "pyhanko", "tkinterdnd2"]
 PDF_EXTS = {".pdf"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff", ".gif"}
 FILE_TYPES = [
@@ -115,6 +118,10 @@ def load_libraries():
             pillow_heif.register_heif_opener()
     except ImportError:
         missing.append("pillow-heif")
+    try:
+        import pyhanko.sign  # noqa: F401
+    except ImportError:
+        missing.append("pyhanko")
     try:
         import tkinterdnd2  # noqa: F401
     except ImportError:
@@ -698,7 +705,7 @@ MARK_GLYPHS = {"check": "4", "cross": "8"}  # ✔ and ✘ in the standard ZapfDi
 
 def mark_size(m):
     """A placed item's width and height in points (as created, before any later page turn)."""
-    if m["kind"] in ("text", "date"):
+    if m["kind"] in ("text", "date", "box"):
         return text_width(m["text"], m["size"]) + 2, m["size"] * 1.25
     if m["kind"] in MARK_GLYPHS:
         return m["size"] * 0.9, m["size"]
@@ -758,6 +765,416 @@ def auto_trim(pil_image, threshold=245, pad=0.01):
     w, h = pil_image.size
     return (max(0.0, box[0] / w - pad), max(0.0, box[1] / h - pad),
             max(0.0, 1 - box[2] / w - pad), max(0.0, 1 - box[3] / h - pad))
+
+
+# ---- comments (standard PDF annotations, each with its own appearance) ----------- #
+COMMENT_COLORS = {"Yellow": (1.0, 0.85, 0.1), "Green": (0.35, 0.8, 0.3), "Blue": (0.25, 0.55, 1.0),
+                  "Pink": (1.0, 0.45, 0.7), "Red": (0.9, 0.15, 0.15)}
+TEXT_MARKUP = ("highlight", "underline", "strike")
+SHAPES = ("rect", "ellipse", "arrow", "ink")
+COMMENT_KINDS = TEXT_MARKUP + SHAPES + ("note", "box")
+
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(int(c * 255) for c in rgb)
+
+
+def _bounds(points, pad=0.0):
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    return [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+
+
+def _form_xobject(pdf, ops, bbox, res=None, matrix=None):
+    kw = dict(Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, BBox=[round(v, 3) for v in bbox],
+              Resources=res or pikepdf.Dictionary())
+    if matrix:
+        kw["Matrix"] = matrix
+    return pdf.make_stream(ops.encode("latin-1") if isinstance(ops, str) else ops, **kw)
+
+
+def _ellipse_ops(x0, y0, x1, y1):
+    k = 0.5523
+    cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    return (f"{cx + rx:.2f} {cy:.2f} m {cx + rx:.2f} {cy + k * ry:.2f} {cx + k * rx:.2f} {cy + ry:.2f} {cx:.2f} {cy + ry:.2f} c "
+            f"{cx - k * rx:.2f} {cy + ry:.2f} {cx - rx:.2f} {cy + k * ry:.2f} {cx - rx:.2f} {cy:.2f} c "
+            f"{cx - rx:.2f} {cy - k * ry:.2f} {cx - k * rx:.2f} {cy - ry:.2f} {cx:.2f} {cy - ry:.2f} c "
+            f"{cx + k * rx:.2f} {cy - ry:.2f} {cx + rx:.2f} {cy - k * ry:.2f} {cx + rx:.2f} {cy:.2f} c")
+
+
+def arrow_head(x1, y1, x2, y2, size):
+    """The two short lines of an open arrowhead at (x2, y2)."""
+    import math
+    a = math.atan2(y2 - y1, x2 - x1)
+    return [(x2 - size * math.cos(a - 0.45), y2 - size * math.sin(a - 0.45)),
+            (x2 - size * math.cos(a + 0.45), y2 - size * math.sin(a + 0.45))]
+
+
+def comment_annotation(pdf, m, box):
+    """A comment as a standard PDF annotation (Highlight, Underline, StrikeOut, Text,
+    FreeText, Square, Circle, Line, Ink), so other PDF apps show and edit it."""
+    N = pikepdf.Name
+    col = m["color"]
+    rgb = f"{col[0]:.3f} {col[1]:.3f} {col[2]:.3f}"
+    lw = m.get("width", 2)
+    annot = pikepdf.Dictionary(Type=N.Annot, F=4, C=list(col), NM=pikepdf.String(f"pdftoolkit-{m['id']}"),
+                               T=pikepdf.String(m.get("author", "")), M=pikepdf.String(time.strftime("D:%Y%m%d%H%M%S")))
+    if m.get("text"):
+        annot.Contents = pikepdf.String(m["text"])
+    kind = m["kind"]
+    if kind in TEXT_MARKUP:
+        rects = m["rects"]
+        quads = []
+        for l, b, r, t in rects:
+            quads += [l, t, r, t, l, b, r, b]
+        rect = _bounds([(l, b) for l, b, _, _ in rects] + [(r, t) for _, _, r, t in rects], 1)
+        annot.Subtype = {"highlight": N.Highlight, "underline": N.Underline, "strike": N.StrikeOut}[kind]
+        annot.QuadPoints = [round(v, 3) for v in quads]
+        ops, res = [], pikepdf.Dictionary()
+        if kind == "highlight":
+            res.ExtGState = pikepdf.Dictionary(GS=pdf.make_indirect(pikepdf.Dictionary(Type=N.ExtGState, BM=N.Multiply,
+                                                                                        ca=1, CA=1)))
+            ops.append(f"/GS gs {rgb} rg")
+            ops += [f"{l:.2f} {b:.2f} {r - l:.2f} {t - b:.2f} re f" for l, b, r, t in rects]
+        else:
+            ops.append(f"{rgb} RG")
+            for l, b, r, t in rects:
+                h = t - b
+                y = b + h * 0.08 if kind == "underline" else b + h * 0.42
+                ops.append(f"{max(0.6, h * 0.07):.2f} w {l:.2f} {y:.2f} m {r:.2f} {y:.2f} l S")
+        ap = _form_xobject(pdf, "\n".join(ops), rect, res)
+    elif kind == "note":
+        x, y = m["x"], m["y"]  # top-left corner of the icon
+        rect = [x, y - 20, x + 20, y]
+        annot.Subtype = N.Text
+        annot.Name = N.Comment
+        annot.Open = False
+        ops = (f"{rgb} rg 0.25 G 0.8 w {x + 1:.2f} {y - 19:.2f} 18 15 re B "
+               f"{x + 5:.2f} {y - 4:.2f} m {x + 5:.2f} {y - 1:.2f} l {x + 9:.2f} {y - 4:.2f} l f "
+               f"0.25 G 1 w {x + 4:.2f} {y - 9:.2f} m {x + 16:.2f} {y - 9:.2f} l S "
+               f"{x + 4:.2f} {y - 13:.2f} m {x + 16:.2f} {y - 13:.2f} l S")
+        ap = _form_xobject(pdf, ops, rect)
+    elif kind == "box":
+        # A text box: like placed text, but with a coloured border.
+        w, h = mark_size(m)
+        w, h = w + 8, h + 6
+        a, b, c, d, _, _ = shown_matrix(box, m["rot"])
+        ex, ey = (h / 2, w / 2) if m["rot"] % 180 else (w / 2, h / 2)
+        rect = [m["x"] - ex, m["y"] - ey, m["x"] + ex, m["y"] + ey]
+        annot.Subtype = N.FreeText
+        annot.DA = pikepdf.String(f"/Helv {m['size']:.1f} Tf 0 g")
+        annot.BS = pikepdf.Dictionary(W=1)
+        res = pikepdf.Dictionary(Font=pikepdf.Dictionary(Helv=pdf.make_indirect(pikepdf.Dictionary(
+            Type=N.Font, Subtype=N.Type1, BaseFont=N.Helvetica, Encoding=N.WinAnsiEncoding))))
+        ops = (f"q 1 1 1 rg {rgb} RG 1.2 w 0.6 0.6 {w - 1.2:.2f} {h - 1.2:.2f} re B Q "
+               f"q BT 0 g /Helv {m['size']:.2f} Tf 5 {3 + m['size'] * 0.27:.2f} Td ").encode() + _pdf_text(m["text"]) + b" Tj ET Q"
+        ap = _form_xobject(pdf, ops, [0, 0, w, h], res, [a, b, c, d, 0, 0])
+    elif kind in ("rect", "ellipse"):
+        x0, y0, x1, y1 = m["rect"]
+        rect = [x0 - lw, y0 - lw, x1 + lw, y1 + lw]
+        annot.Subtype = N.Square if kind == "rect" else N.Circle
+        annot.BS = pikepdf.Dictionary(W=lw)
+        path = (f"{x0:.2f} {y0:.2f} {x1 - x0:.2f} {y1 - y0:.2f} re" if kind == "rect" else _ellipse_ops(x0, y0, x1, y1))
+        ap = _form_xobject(pdf, f"{rgb} RG {lw} w {path} S", rect)
+    elif kind == "arrow":
+        (x1, y1), (x2, y2) = m["points"]
+        head = arrow_head(x1, y1, x2, y2, 6 + lw * 2)
+        rect = _bounds([(x1, y1), (x2, y2)] + head, lw + 2)
+        annot.Subtype = N.Line
+        annot.L = [x1, y1, x2, y2]
+        annot.LE = [N("/None"), N.OpenArrow]
+        annot.BS = pikepdf.Dictionary(W=lw)
+        ops = (f"{rgb} RG {lw} w 1 J 1 j {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S "
+               f"{head[0][0]:.2f} {head[0][1]:.2f} m {x2:.2f} {y2:.2f} l {head[1][0]:.2f} {head[1][1]:.2f} l S")
+        ap = _form_xobject(pdf, ops, rect)
+    elif kind == "ink":
+        strokes = m["strokes"]
+        rect = _bounds([p for s in strokes for p in s], lw + 1)
+        annot.Subtype = N.Ink
+        annot.InkList = [[round(v, 2) for p in s for v in p] for s in strokes]
+        annot.BS = pikepdf.Dictionary(W=lw)
+        ops = [f"{rgb} RG {lw} w 1 J 1 j"]
+        for s in strokes:
+            ops.append(f"{s[0][0]:.2f} {s[0][1]:.2f} m " + " ".join(f"{x:.2f} {y:.2f} l" for x, y in s[1:]) + " S"
+                       if len(s) > 1 else f"{s[0][0]:.2f} {s[0][1]:.2f} m {s[0][0] + 0.1:.2f} {s[0][1]:.2f} l S")
+        ap = _form_xobject(pdf, "\n".join(ops), rect)
+    else:
+        raise ValueError(kind)
+    annot.Rect = [round(v, 3) for v in rect]
+    annot.AP = pikepdf.Dictionary(N=ap)
+    if kind == "highlight":
+        annot.CA = 1
+    return pdf.make_indirect(annot)
+
+
+# ---- new form fields ------------------------------------------------------------ #
+FIELD_KINDS = {"text": "Text field", "check": "Checkbox", "choice": "Dropdown", "signature": "Signature field"}
+
+
+def _acroform(pdf):
+    N = pikepdf.Name
+    if "/AcroForm" not in pdf.Root:
+        pdf.Root.AcroForm = pdf.make_indirect(pikepdf.Dictionary(Fields=pikepdf.Array()))
+    af = pdf.Root.AcroForm
+    if "/Fields" not in af:
+        af.Fields = pikepdf.Array()
+    dr = af.get("/DR")
+    if not isinstance(dr, pikepdf.Dictionary):
+        af.DR = dr = pikepdf.Dictionary()
+    if "/Font" not in dr:
+        dr.Font = pikepdf.Dictionary()
+    if "/Helv" not in dr.Font:
+        dr.Font.Helv = pdf.make_indirect(pikepdf.Dictionary(Type=N.Font, Subtype=N.Type1, BaseFont=N.Helvetica,
+                                                            Encoding=N.WinAnsiEncoding))
+    if "/ZaDb" not in dr.Font:
+        dr.Font.ZaDb = pdf.make_indirect(pikepdf.Dictionary(Type=N.Font, Subtype=N.Type1, BaseFont=N.ZapfDingbats))
+    if "/DA" not in af:
+        af.DA = pikepdf.String("/Helv 0 Tf 0 g")
+    return af
+
+
+def add_form_fields(pdf, page, fields, rot):
+    """Create fillable fields (made with Prepare form) on an output page."""
+    N = pikepdf.Name
+    af = _acroform(pdf)
+    taken = {_full_name(f) for f in _walk_fields(af.Fields)}
+    annots = pikepdf.Array(list(page.obj.get("/Annots", [])))
+    for f in fields:
+        name, n = f["name"], 2
+        while name in taken:
+            name, n = f"{f['name']}_{n}", n + 1
+        taken.add(name)
+        w = pikepdf.Dictionary(Type=N.Annot, Subtype=N.Widget, Rect=[round(v, 3) for v in f["rect"]], F=4,
+                               P=page.obj, T=pikepdf.String(name),
+                               MK=pikepdf.Dictionary(BC=[0.45, 0.5, 0.6], BG=[0.92, 0.95, 1.0], R=rot))
+        if f["kind"] == "text":
+            w.FT = N.Tx
+            w.DA = pikepdf.String("/Helv 0 Tf 0 g")
+            if f.get("multiline"):
+                w.Ff = 1 << 12
+            if f.get("value"):
+                w.V = pikepdf.String(f["value"])
+        elif f["kind"] == "choice":
+            w.FT = N.Ch
+            w.Ff = 1 << 17  # a dropdown
+            w.Opt = pikepdf.Array([pikepdf.String(o) for o in f.get("options", [])])
+            w.DA = pikepdf.String("/Helv 0 Tf 0 g")
+            if f.get("value"):
+                w.V = pikepdf.String(f["value"])
+        elif f["kind"] == "check":
+            x0, y0, x1, y1 = f["rect"]
+            s = min(x1 - x0, y1 - y0)
+            on = _form_xobject(pdf, f"q 0 g BT /ZaDb {s * 0.8:.2f} Tf {s * 0.12:.2f} {s * 0.2:.2f} Td (4) Tj ET Q",
+                               [0, 0, x1 - x0, y1 - y0],
+                               pikepdf.Dictionary(Font=pikepdf.Dictionary(ZaDb=af.DR.Font.ZaDb)))
+            off = _form_xobject(pdf, "", [0, 0, x1 - x0, y1 - y0])
+            w.FT = N.Btn
+            w.AP = pikepdf.Dictionary(N=pikepdf.Dictionary(Yes=on, Off=off))
+            w.V = w.AS = N.Yes if f.get("value") else N.Off
+            w.MK.CA = pikepdf.String("4")
+        elif f["kind"] == "signature":
+            w.FT = N.Sig
+        w = pdf.make_indirect(w)
+        annots.append(w)
+        af.Fields.append(w)
+    page.obj.Annots = annots
+    af.NeedAppearances = True
+
+
+def _walk_fields(fields):
+    for f in fields:
+        yield f
+        if "/Kids" in f:
+            yield from _walk_fields(f.Kids)
+
+
+# ---- certificate signatures (pyHanko) ---------------------------------------------- #
+CERT_PATH = os.path.join(SIG_DIR, "certificate.p12")
+
+
+def create_certificate(name, email, password, path=CERT_PATH):
+    """A self-signed signing certificate, saved as a password-protected .p12 file."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    attrs = [x509.NameAttribute(NameOID.COMMON_NAME, name)]
+    if email:
+        attrs.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, email))
+    subject = x509.Name(attrs)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=True, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                                         crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.EMAIL_PROTECTION]), critical=False)
+            .sign(key, hashes.SHA256()))
+    data = pkcs12.serialize_key_and_certificates(name.encode("utf-8"), key, cert, None,
+                                                serialization.BestAvailableEncryption(password.encode("utf-8")))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def load_signer(path, password):
+    """The signing key and certificate from a .p12/.pfx file. Raises ValueError with a
+    readable reason for a wrong password or a file without a key."""
+    import logging
+    logging.getLogger("pyhanko").setLevel(logging.CRITICAL)
+    logging.getLogger("pyhanko_certvalidator").setLevel(logging.CRITICAL)
+    from pyhanko.sign import signers
+    try:
+        signer = signers.SimpleSigner.load_pkcs12(path, passphrase=password.encode("utf-8") if password else None)
+    except Exception as e:
+        raise ValueError(f"Couldn't open the certificate: {e}") from e
+    if signer is None:
+        raise ValueError("Couldn't open the certificate. Check the password.")
+    return signer
+
+
+def signer_name(signer):
+    subj = signer.signing_cert.subject.native
+    return subj.get("common_name") or subj.get("email_address") or "Unknown"
+
+
+def signature_appearance(name, when, reason, image, w, h):
+    """The visible box of a certificate signature: the handwritten signature (if any)
+    on the left, who signed, when and why on the right."""
+    from PIL import ImageDraw, ImageFont
+    scale = 6  # pixels per point, so it prints sharply
+    W, H = max(1, int(w * scale)), max(1, int(h * scale))
+    im = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, W - 1, H - 1], outline=(70, 90, 130, 255), width=max(2, scale // 2))
+    text_x = 10 * scale // 2
+    if image is not None:
+        box_w = int(W * 0.45)
+        sig = image.copy()
+        sig.thumbnail((box_w - 6 * scale, H - 6 * scale), Image.Resampling.LANCZOS)
+        im.alpha_composite(sig, (3 * scale + (box_w - 6 * scale - sig.width) // 2, (H - sig.height) // 2))
+        text_x = box_w
+    try:
+        font = ImageFont.truetype("arial.ttf" if sys.platform == "win32" else "Helvetica.ttc", 10)
+    except OSError:
+        font = None
+    lines = [f"Digitally signed by {name}", f"Date: {when}"] + ([f"Reason: {reason}"] if reason else [])
+    # The largest text size that fits the room left.
+    avail_w, avail_h = W - text_x - 4 * scale, H - 6 * scale
+    size = max(6, min(int(avail_h / (len(lines) * 1.3)), 13 * scale))
+    while size > 6:
+        try:
+            font = ImageFont.truetype("arial.ttf" if sys.platform == "win32" else "Helvetica.ttc", size)
+        except OSError:
+            font = ImageFont.load_default()
+            break
+        if max(d.textlength(l, font=font) for l in lines) <= avail_w:
+            break
+        size -= 2
+    y = (H - len(lines) * size * 1.3) / 2
+    for line in lines:
+        d.text((text_x, y), line, font=font, fill=(25, 35, 60, 255))
+        y += size * 1.3
+    return im
+
+
+def sign_pdf_file(src_path, dst_path, req, password=None):
+    """Add a certificate signature to a finished PDF (as the very last step: any change
+    after this would break it). req: path, password, page, rect, reason, location, image."""
+    from pyhanko.pdf_utils.images import PdfImage
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields, signers
+    from pyhanko.stamp import TextStampStyle
+    signer = load_signer(req["path"], req["password"])
+    name = signer_name(signer)
+    x0, y0, x1, y1 = req["rect"]
+    when = time.strftime("%d %b %Y %H:%M").lstrip("0")
+    ap = signature_appearance(name, when, req.get("reason"), req.get("image"), x1 - x0, y1 - y0)
+    with open(src_path, "rb") as f:
+        w = IncrementalPdfFileWriter(io.BytesIO(f.read()))
+    if password:
+        w.encrypt(password)
+    field = f"Signature_{time.strftime('%Y%m%d%H%M%S')}"
+    fields.append_signature_field(w, fields.SigFieldSpec(field, on_page=req["page"], box=(x0, y0, x1, y1)))
+    meta = signers.PdfSignatureMetadata(field_name=field, reason=req.get("reason") or None,
+                                        location=req.get("location") or None, md_algorithm="sha256", name=name)
+    style = TextStampStyle(stamp_text="", background=PdfImage(ap), background_opacity=1.0, border_width=0)
+    with open(dst_path, "wb") as out:
+        signers.PdfSigner(meta, signer=signer, stamp_style=style).sign_pdf(w, output=out)
+    return name
+
+
+def check_signatures(data, password=None):
+    """Existing certificate signatures in a PDF: [dict(field, name, when, intact, covers_all)].
+    'intact' = nothing changed since signing. Who the signer is can't be confirmed
+    offline without a list of trusted authorities, so that's not claimed."""
+    import logging
+    logging.getLogger("pyhanko").setLevel(logging.CRITICAL)
+    logging.getLogger("pyhanko_certvalidator").setLevel(logging.CRITICAL)
+    from pyhanko.pdf_utils.reader import PdfFileReader
+    from pyhanko.sign.validation import validate_pdf_signature
+    from pyhanko_certvalidator import ValidationContext
+    out = []
+    r = PdfFileReader(io.BytesIO(data))
+    if r.encrypted and password:
+        r.decrypt(password)
+    for sig in r.embedded_signatures:
+        try:
+            st = validate_pdf_signature(sig, ValidationContext(allow_fetching=False, trust_roots=[]))
+            subj = st.signing_cert.subject.native
+            when = st.signer_reported_dt.strftime("%d %b %Y %H:%M").lstrip("0") if st.signer_reported_dt else "?"
+            out.append(dict(field=sig.field_name, name=subj.get("common_name") or subj.get("email_address") or "?",
+                            when=when, intact=bool(st.intact and st.valid),
+                            covers_all=str(st.coverage).endswith("ENTIRE_FILE")))
+        except Exception as e:
+            out.append(dict(field=sig.field_name, name="?", when="?", intact=False, covers_all=False, error=str(e)))
+    return out
+
+
+# ---- comparing two PDFs ------------------------------------------------------------ #
+def diff_boxes(a, b, cell=8, threshold=40):
+    """Rectangles (in pixels) around the places where two same-sized renders differ."""
+    from PIL import ImageChops
+    mask = ImageChops.difference(a.convert("L"), b.convert("L")).point(lambda v: 255 if v > threshold else 0)
+    small = mask.resize((max(1, mask.width // cell), max(1, mask.height // cell)), Image.Resampling.BOX)
+    sw, sh = small.size
+    px = small.load()
+    seen = set()
+    boxes = []
+    for y in range(sh):
+        for x in range(sw):
+            if px[x, y] < 8 or (x, y) in seen:
+                continue
+            # flood-fill the connected changed cells (with a cell of slack)
+            stack, x0, y0, x1, y1 = [(x, y)], x, y, x, y
+            seen.add((x, y))
+            while stack:
+                cx, cy = stack.pop()
+                x0, y0, x1, y1 = min(x0, cx), min(y0, cy), max(x1, cx), max(y1, cy)
+                for nx in range(cx - 2, cx + 3):
+                    for ny in range(cy - 2, cy + 3):
+                        if 0 <= nx < sw and 0 <= ny < sh and (nx, ny) not in seen and px[nx, ny] >= 8:
+                            seen.add((nx, ny))
+                            stack.append((nx, ny))
+            boxes.append((x0 * cell - 3, y0 * cell - 3, (x1 + 1) * cell + 3, (y1 + 1) * cell + 3))
+    return boxes
+
+
+def word_changes(old, new):
+    """Words removed and added between two texts: [('removed'|'added', 'text')]."""
+    import difflib
+    a, b = old.split(), new.split()
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op in ("delete", "replace"):
+            out.append(("removed", " ".join(a[i1:i2])))
+        if op in ("insert", "replace"):
+            out.append(("added", " ".join(b[j1:j2])))
+    return out
 
 
 def explain_error(e):
@@ -886,6 +1303,9 @@ class ToolkitApp:
         self.fill = {}  # doc id -> {form field name: value}
         self.field_cache = {}  # doc id -> its form fields
         self.docinfo = {}  # title, author… for the saved PDF (empty = keep the original's)
+        self.new_fields = {}  # page uid -> form fields made with Prepare form
+        self.cert_request = None  # a certificate signature to add when saving
+        self.sig_cache = {}  # doc id -> its existing certificate signatures
         self.mark_seq = 0
         self.dirty = False
         self.busy = False
@@ -997,9 +1417,22 @@ class ToolkitApp:
         for i, yy in enumerate((14, 18, 22)):
             mark.create_line(7, yy, 20 if i < 2 else 15, yy, fill=UI["accent"], width=2)
         mark.pack(side="left", padx=(14, 8))
-        tk.Label(bar, text="PDF Toolkit", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left")
-        self.doc_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#b8b8b8", font=UI["font"])
-        self.doc_lbl.pack(side="left", padx=(14, 0))
+        tk.Label(bar, text="PDF Toolkit", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left", padx=(0, 14))
+        self.mode_btns = []
+        for label, cmd, tip in (("Organize", None, "Arrange, rotate, crop and combine pages"),
+                                ("View", lambda: self.open_editor("view"), "Read, search and copy text"),
+                                ("Comment", lambda: self.open_editor("comment"), "Highlight, notes, shapes, drawing"),
+                                ("Fill & Sign", lambda: self.open_editor("fill"), "Fill in forms and sign"),
+                                ("Prepare form", lambda: self.open_editor("form"), "Add fillable fields"),
+                                ("Compare", lambda: CompareWindow(self), "Compare two PDFs")):
+            b = FlatButton(bar, label, cmd or (lambda: None), UI["appbar"], fg="#d8d8d8", hover="#4a4a4a",
+                           font=UI["bold"], padx=10, pady=12, tip=tip)
+            b.pack(side="left")
+            if cmd is None:
+                b.colors.update(bg="#3d4f6b", fg="#ffffff")
+                b.config(bg="#3d4f6b", fg="#ffffff", cursor="")
+            else:
+                self.mode_btns.append(b)
         self.save_btn = FlatButton(bar, "  Save as PDF  ", self.save_all, UI["appbar"], primary=True,
                                    font=UI["bold"], pady=6, tip="Save every page in the workspace as one PDF (Ctrl+S)")
         self.save_btn.pack(side="right", padx=14, pady=8)
@@ -1125,8 +1558,8 @@ class ToolkitApp:
         tools = tk.Frame(main, bg=UI["toolbar"], height=44, highlightthickness=1, highlightbackground=UI["border"])
         tools.pack(fill="x")
         tools.pack_propagate(False)
-        tk.Label(tools, text="Organize pages", bg=UI["toolbar"], fg=UI["text"], font=UI["bold"]).pack(
-            side="left", padx=(14, 12))
+        self.doc_lbl = tk.Label(tools, text="", bg=UI["toolbar"], fg=UI["text"], font=UI["bold"])
+        self.doc_lbl.pack(side="left", padx=(14, 10))
         self.tool_btns = []
         for text, cmd, tip in (("⟲", lambda: self.rotate(-90), "Rotate left"),
                                ("⟳", lambda: self.rotate(90), "Rotate right"),
@@ -1144,11 +1577,6 @@ class ToolkitApp:
             btn.pack(side="left", padx=1)
             self.tool_btns.append(btn)
         self.undo_btn, self.redo_btn = self.tool_btns[-2], self.tool_btns[-1]
-        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=6, pady=9)
-        self.sign_btn = FlatButton(tools, "✍  Fill & Sign", self.fill_sign, UI["toolbar"], font=UI["bold"],
-                                   tip="Fill in forms, add text, ticks, the date and your signature")
-        self.sign_btn.pack(side="left")
-        self.tool_btns.append(self.sign_btn)
         self.clear_btn = FlatButton(tools, "Clear all", self.clear_all, UI["toolbar"], tip="Empty the workspace")
         self.clear_btn.pack(side="right", padx=(0, 10))
         zoom_icon = tk.Label(tools, text="🔍", bg=UI["toolbar"], fg=UI["muted"], font=UI["font"])
@@ -1214,8 +1642,8 @@ class ToolkitApp:
         for label, cmd in (("Rotate left", lambda: self.rotate(-90)), ("Rotate right", lambda: self.rotate(90)),
                            ("Duplicate", self.duplicate), ("Delete", self.delete), ("Crop…", self.crop),
                            ("Insert blank page after", self.insert_blank), (None, None),
-                           ("Fill & Sign this page", self.fill_sign),
-                           ("View larger", self.view_selected), ("Save selected pages as PDF…", self.extract),
+                           ("Fill & Sign this page", self.fill_sign), ("Comment on this page", lambda: self.open_editor("comment")),
+                           ("Open in the editor", self.view_selected), ("Save selected pages as PDF…", self.extract),
                            ("Export selected pages as images…", lambda: self.export_images(selected_only=True)),
                            (None, None), ("Select all", self.select_all)):
             if label:
@@ -1449,14 +1877,15 @@ class ToolkitApp:
         n = len(self.pages)
         names = sorted({self.docs[p["doc"]].name for p in self.pages})
         label = ("" if not names else names[0] if len(names) == 1 else f"{len(names)} files")
-        self.doc_lbl.config(text=(f"{label}  —  {n} page{'s' * (n != 1)}" + ("  •  not saved" if self.dirty else ""))
-                            if n else "")
+        self.doc_lbl.config(text=(f"{label} — {n} page{'s' * (n != 1)}" + (" •" if self.dirty else ""))
+                            if n else "Organize pages")
         self.root.title(f"PDF Toolkit — {label}" if n else "PDF Toolkit")
         idle = not self.busy
         for btn in self.tool_btns + [self.open_btn, self.clear_btn]:
             btn.set_enabled(idle)
         self.undo_btn.set_enabled(bool(self.undo_stack) and idle)
-        self.sign_btn.set_enabled(bool(n) and idle)
+        for b in self.mode_btns[:-1]:  # Compare works without open pages
+            b.set_enabled(bool(n) and idle)
         self.redo_btn.set_enabled(bool(self.redo_stack) and idle)
         for btn in self.action_btns + [self.save_btn, self.print_btn]:
             btn.set_enabled(bool(n) and idle)
@@ -1581,7 +2010,7 @@ class ToolkitApp:
         if k is not None:
             self.selected = {self.pages[k]["uid"]}
             self._refresh_selection()
-            self.view_selected()
+            self.open_editor("view")
 
     def _on_menu(self, event):
         if self.busy:
@@ -1618,30 +2047,45 @@ class ToolkitApp:
         return (list(self.pages), set(self.selected), self._fill_state())
 
     def _restore(self, snap):
-        self.pages, self.selected, (marks, fill) = snap[0], snap[1], snap[2]
+        self.pages, self.selected, (marks, fill, fields, cert) = snap[0], snap[1], snap[2]
         self.marks = {u: [dict(m) for m in ms] for u, ms in marks.items()}
         self.fill = {d: dict(v) for d, v in fill.items()}
+        self.new_fields = {u: [dict(f) for f in fs] for u, fs in fields.items()}
+        self.cert_request = dict(cert) if cert else None
 
     def _fill_state(self):
-        return ({u: [dict(m) for m in ms] for u, ms in self.marks.items()}, {d: dict(v) for d, v in self.fill.items()})
+        return ({u: [dict(m) for m in ms] for u, ms in self.marks.items()}, {d: dict(v) for d, v in self.fill.items()},
+                {u: [dict(f) for f in fs] for u, fs in self.new_fields.items()},
+                dict(self.cert_request) if self.cert_request else None)
 
     def _fill_done(self, before):
         """Fill & Sign closed: one undo step for everything done in it."""
         after = self._fill_state()
-        strip = lambda st: ({u: [{k: v for k, v in m.items() if k != "_photos"} for m in ms] for u, ms in st[0].items()},
-                            {d: {k: v for k, v in vals.items()} for d, vals in st[1].items() if vals})  # noqa: E731
+        strip = lambda st: ({u: [{k: v for k, v in m.items() if k != "_photos"} for m in ms] for u, ms in st[0].items() if ms},
+                            {d: {k: v for k, v in vals.items()} for d, vals in st[1].items() if vals},
+                            {u: fs for u, fs in st[2].items() if fs},
+                            (st[3]["uid"], st[3]["rect"], st[3]["path"]) if st[3] else None)  # noqa: E731
         if strip(after) != strip(before):
             self.undo_stack.append((list(self.pages), set(self.selected), before))
             self.redo_stack.clear()
             self.dirty = True
             n = sum(len(v) for v in self.marks.values())
             f = sum(len(v) for v in self.fill.values())
-            self._status(f"Filled in: {f} form field value{'s' * (f != 1)}, {n} placed item{'s' * (n != 1)}. "
-                         "They're added when you save.")
+            nf = sum(len(v) for v in self.new_fields.values())
+            parts = [f"{n} comment{'s' * (n != 1)} and placed item{'s' * (n != 1)}"]
+            if f:
+                parts.append(f"{f} filled-in field{'s' * (f != 1)}")
+            if nf:
+                parts.append(f"{nf} new form field{'s' * (nf != 1)}")
+            if self.cert_request:
+                parts.append("a certificate signature")
+            self._status("Editor: " + ", ".join(parts) + ". They're added when you save.")
         self._redraw()
 
     def _has_fill(self, page):
-        if self.marks.get(page["uid"]):
+        if self.marks.get(page["uid"]) or self.new_fields.get(page["uid"]):
+            return True
+        if self.cert_request and self.cert_request["uid"] == page["uid"]:
             return True
         vals = self.fill.get(page["doc"])
         return bool(vals) and any(f["page"] == page["index"] and f["name"] in vals
@@ -1713,6 +2157,7 @@ class ToolkitApp:
             return
         self.pages, self.selected, self.undo_stack, self.redo_stack = [], set(), [], []
         self.marks, self.fill, self.field_cache, self.docinfo = {}, {}, {}, {}
+        self.new_fields, self.cert_request, self.sig_cache = {}, None, {}
         with PDFIUM_LOCK:
             for doc in self.docs.values():
                 if doc.render is not None:
@@ -1815,10 +2260,36 @@ class ToolkitApp:
         return self.mark_seq
 
     def fill_sign(self):
+        self.open_editor("fill")
+
+    def open_editor(self, mode):
         if self.busy or not self.pages:
             return
         ks = [k for k, p in enumerate(self.pages) if p["uid"] in self.selected]
-        FillSignWindow(self, ks[0] if ks else 0)
+        PageEditor(self, ks[0] if ks else 0, mode)
+
+    def _signatures(self, doc_id):
+        """The certificate signatures already in a source file (checked once)."""
+        if doc_id not in self.sig_cache:
+            doc = self.docs[doc_id]
+            sigs = []
+            if b"/ByteRange" in doc.data:
+                try:
+                    sigs = check_signatures(doc.data, doc.password or None)
+                except Exception as e:
+                    log_error(f"Check signatures of {doc.name}: {type(e).__name__}: {e}")
+            self.sig_cache[doc_id] = sigs
+        return self.sig_cache[doc_id]
+
+    def _confirm_signed(self, pages):
+        """Saving makes a new file, so signatures in the originals don't carry over: say so first."""
+        signed = sorted({self.docs[p["doc"]].name for p in pages if self._signatures(p["doc"])})
+        if not signed:
+            return True
+        return messagebox.askyesno(
+            "Signed document", f"{', '.join(signed)} has a certificate signature. A signature only stays valid in "
+            "the exact file that was signed, so the copy you're saving won't carry it (the original file is not "
+            "changed).\n\nSave anyway?")
 
     def _source_info(self):
         first = self.docs[self.pages[0]["doc"]] if self.pages else None
@@ -1833,13 +2304,15 @@ class ToolkitApp:
     def _ask_flatten(self, pages, o):
         """Decide whether to flatten. Asks when something was filled in or placed and the
         Tools panel doesn't already say. Returns True, False, or None to stop."""
+        if any(self.new_fields.get(p["uid"]) for p in pages):
+            return False  # flattening would turn the new form fields into plain text
         if o["flatten"]:
             return True
-        if not any(self._has_fill(p) for p in pages):
+        if not any(self.marks.get(p["uid"]) or (self.fill.get(p["doc"]) and self._has_fill(p)) for p in pages):
             return False
         answer = messagebox.askyesnocancel(
             "Flatten the filled-in parts?",
-            "Make the filled-in fields, text and signatures part of the page?\n\n"
+            "Make the filled-in fields, comments, text and signatures part of the page?\n\n"
             "Yes = flatten: nobody can change or move them (best for a signed document).\n"
             "No = keep them editable: they can still be changed in a PDF editor.")
         return answer
@@ -2027,10 +2500,12 @@ class ToolkitApp:
         o = self._options()
         if o is None:
             return
+        if not self._confirm_signed(self.pages):
+            return
         o["flatten"] = self._ask_flatten(self.pages, o)
         if o["flatten"] is None:
             return
-        path = self._ask_save(self.pages, " (signed)" if self.marks else " (edited)")
+        path = self._ask_save(self.pages, " (signed)" if self.marks or self.cert_request else " (edited)")
         if path:
             self._run_save([(list(self.pages), path)], o, mark_clean=True)
 
@@ -2043,6 +2518,8 @@ class ToolkitApp:
             return
         o = self._options()
         if o is None:
+            return
+        if not self._confirm_signed(pages):
             return
         o["flatten"] = self._ask_flatten(pages, o)
         if o["flatten"] is None:
@@ -2089,8 +2566,12 @@ class ToolkitApp:
                 # A new list, so a duplicated page's annotations aren't shared with its twin.
                 annots = pikepdf.Array(list(page.obj.get("/Annots", [])))
                 for m in marks:
-                    annots.append(mark_annotation(out, m, self._page_box(p)))
+                    make = comment_annotation if m["kind"] in COMMENT_KINDS else mark_annotation
+                    annots.append(make(out, m, self._page_box(p)))
                 page.obj.Annots = annots
+            if self.new_fields.get(p["uid"]):
+                add_form_fields(out, page, self.new_fields[p["uid"]], self._total_rot(p))
+                filled = True
             used.append((p["doc"], p["index"], len(out.pages) - 1))
             if "/AcroForm" in src.Root and src not in forms:
                 forms.append(src)
@@ -2134,7 +2615,6 @@ class ToolkitApp:
 
     def _run_save(self, jobs, o, mark_clean=False, open_after=False):
         """Save each (pages, path) job in the background."""
-        names = [os.path.normcase(os.path.abspath(path)) for _, path in jobs]
         self._set_busy(True)
         self._status("Saving…")
 
@@ -2154,9 +2634,21 @@ class ToolkitApp:
                     if o["password"]:
                         kw["encryption"] = pikepdf.Encryption(user=o["password"], owner=o["password"], R=6)
                     part = path + ".part"
+                    req = self.cert_request
+                    sign_at = next((i for i, p in enumerate(pages) if req and p["uid"] == req["uid"]), None)
                     try:
                         out.save(part, **kw)
                         out.close()
+                        if sign_at is not None and not open_after:
+                            # The certificate signature goes on last: any change after it would break it.
+                            self.ui(lambda: self._status("Adding the certificate signature…"))
+                            signed = part + "2"
+                            try:
+                                sign_pdf_file(part, signed, dict(req, page=sign_at), o["password"])
+                                os.replace(signed, part)
+                            finally:
+                                if os.path.exists(signed):
+                                    os.remove(signed)
                         os.replace(part, path)  # Cancel or a crash never leaves half a file
                     finally:
                         if os.path.exists(part):
@@ -2244,9 +2736,7 @@ class ToolkitApp:
         threading.Thread(target=work, daemon=True).start()
 
     def view_selected(self):
-        pages = [p for p in self.pages if p["uid"] in self.selected]
-        if pages:
-            PageViewer(self, pages[0])
+        self.open_editor("view")
 
     # ---- busy state ------------------------------------------------------ #
     def _set_busy(self, busy, cancellable=True):
@@ -2658,91 +3148,342 @@ class PropertiesDialog:
         self.win.destroy()
 
 
-class FillSignWindow:
-    """Fill in forms and sign: type into the PDF's own fields, or click anywhere to
-    add text, a tick, a cross, the date, your signature or your initials."""
-    TOOLS = (("text", "Ab", "Add text"), ("check", "✓", "Add a tick"), ("cross", "✗", "Add a cross"),
-             ("date", "📅", "Add today's date"))
+class CertificateDialog:
+    """Choose the certificate for a certificate signature: your own .p12/.pfx file,
+    or a self-signed one made here."""
+    def __init__(self, parent, on_done):
+        self.on_done = on_done
+        w = self.win = tk.Toplevel(parent)
+        w.title("Sign with a certificate")
+        w.transient(parent)
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack(fill="both", expand=True)
+        have = os.path.exists(CERT_PATH)
+        self.mode = tk.StringVar(value="saved" if have else "file")
+        self.path = tk.StringVar(value="")
+        self.pw = tk.StringVar()
+        self.name = tk.StringVar()
+        self.email = tk.StringVar()
+        self.new_pw = tk.StringVar()
+        self.new_pw2 = tk.StringVar()
+        self.reason = tk.StringVar(value="I approve this document")
+        self.location = tk.StringVar()
+        self.show_sig = tk.BooleanVar(value=load_signature("signature") is not None)
+        ttk.Label(f, text="A certificate signature proves the document hasn't changed since you signed it.",
+                  wraplength=460).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        r = 1
+        if have:
+            ttk.Radiobutton(f, text="My saved certificate", value="saved", variable=self.mode).grid(
+                row=r, column=0, columnspan=3, sticky="w")
+            r += 1
+        ttk.Radiobutton(f, text="A certificate file (.p12 or .pfx)", value="file", variable=self.mode).grid(
+            row=r, column=0, columnspan=2, sticky="w")
+        ttk.Button(f, text="Choose…", command=self.choose).grid(row=r, column=2, sticky="e")
+        r += 1
+        ttk.Label(f, textvariable=self.path, foreground="gray").grid(row=r, column=0, columnspan=3, sticky="w", padx=(22, 0))
+        r += 1
+        ttk.Label(f, text="Certificate password").grid(row=r, column=0, sticky="w", padx=(22, 0), pady=2)
+        ttk.Entry(f, textvariable=self.pw, show="•", width=26).grid(row=r, column=1, columnspan=2, sticky="w", pady=2)
+        r += 1
+        ttk.Radiobutton(f, text="Create a self-signed certificate", value="new", variable=self.mode).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        r += 1
+        for label, var, show in (("Your name", self.name, ""), ("Email (optional)", self.email, ""),
+                                 ("New password", self.new_pw, "•"), ("Repeat password", self.new_pw2, "•")):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", padx=(22, 0), pady=2)
+            ttk.Entry(f, textvariable=var, show=show, width=26).grid(row=r, column=1, columnspan=2, sticky="w", pady=2)
+            r += 1
+        ttk.Label(f, text="Self-signed: anyone can check the document hasn't changed, but PDF readers will say the "
+                          "signer's identity is unknown. For a trusted identity, use a certificate from your employer "
+                          "or a certificate authority.", foreground="gray", wraplength=460).grid(
+            row=r, column=0, columnspan=3, sticky="w", padx=(22, 0))
+        r += 1
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=8)
+        r += 1
+        for label, var in (("Reason", self.reason), ("Location (optional)", self.location)):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(f, textvariable=var, width=36).grid(row=r, column=1, columnspan=2, sticky="w", pady=2)
+            r += 1
+        ttk.Checkbutton(f, text="Show my handwritten signature in the box", variable=self.show_sig).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        r += 1
+        btns = ttk.Frame(f)
+        btns.grid(row=r, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=w.destroy).pack(side="right")
+        ttk.Button(btns, text="Use this certificate", command=self.ok).pack(side="right", padx=6)
+        w.grab_set()
+        center_over(w, parent)
 
-    def __init__(self, app, start):
+    def choose(self):
+        p = filedialog.askopenfilename(title="Choose your certificate", parent=self.win,
+                                       filetypes=[("Certificates", "*.p12 *.pfx"), ("All files", "*.*")])
+        if p:
+            self.path.set(p)
+            self.mode.set("file")
+
+    def ok(self):
+        mode = self.mode.get()
+        try:
+            if mode == "new":
+                if not self.name.get().strip():
+                    raise ValueError("Type your name.")
+                if len(self.new_pw.get()) < 6 or self.new_pw.get() != self.new_pw2.get():
+                    raise ValueError("The two passwords must match, and be at least 6 characters.")
+                path = create_certificate(self.name.get().strip(), self.email.get().strip(), self.new_pw.get())
+                password = self.new_pw.get()
+            else:
+                path = CERT_PATH if mode == "saved" else self.path.get()
+                if not path:
+                    raise ValueError("Choose your certificate file.")
+                password = self.pw.get()
+            signer = load_signer(path, password)  # checks the password now, not at save time
+        except ValueError as e:
+            messagebox.showwarning("Certificate", str(e), parent=self.win)
+            return
+        except OSError as e:
+            messagebox.showwarning("Certificate", f"Couldn't use the certificate: {e}", parent=self.win)
+            return
+        self.win.destroy()
+        self.on_done(dict(path=path, password=password, name=signer_name(signer), reason=self.reason.get().strip(),
+                          location=self.location.get().strip(),
+                          image=load_signature("signature") if self.show_sig.get() else None))
+
+
+class PageEditor:
+    """One page at a time, large: view and search, comment, fill in and sign,
+    and prepare forms. Everything placed here is added to the PDF when saving."""
+    MODES = (("view", "View"), ("comment", "Comment"), ("fill", "Fill & Sign"), ("form", "Prepare form"))
+    FILL_TOOLS = (("text", "Ab", "Add text"), ("check", "✓", "Add a tick"), ("cross", "✗", "Add a cross"),
+                  ("date", "📅", "Add today's date"))
+    COMMENT_TOOLS = (("highlight", "🖍", "Highlight text (drag over it)"), ("underline", "U̲", "Underline text"),
+                     ("strike", "S̶", "Strike through text"), ("note", "💬", "Sticky note"),
+                     ("box", "▭A", "Text box"), ("rect", "□", "Rectangle"), ("ellipse", "○", "Ellipse"),
+                     ("arrow", "↗", "Arrow"), ("ink", "✎", "Draw freehand"))
+    FORM_TOOLS = (("text", "Text field"), ("check", "Checkbox"), ("choice", "Dropdown"), ("signature", "Signature field"))
+
+    def __init__(self, app, start, mode="view"):
         self.app = app
         self.k = start  # index into app.pages
-        self.tool = None
-        self.sel = None  # id of the selected placed item
+        self.mode, self.tool = None, None
+        self.sel = None  # ("mark", id) or ("field", id)
         self.editing = None
         self.widgets = []
         self.drag = None
+        self.zoom = "fit"
+        self.textpages = {}
+        self.selection = None  # (page uid, start char, count)
+        self.matches, self.match_i = [], -1
+        self.color = "Yellow"
         self.before = app._fill_state()
         w = self.win = tk.Toplevel(app.root)
-        w.title("Fill & Sign — PDF Toolkit")
+        w.title("PDF Toolkit — editor")
         w.configure(bg=UI["canvas"])
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
-        w.geometry(f"{min(1180, sw - 80)}x{min(900, sh - 100)}")
-        w.minsize(760, 560)
+        w.geometry(f"{min(1240, sw - 80)}x{min(920, sh - 100)}")
+        w.minsize(900, 600)
         w.transient(app.root)
         w.protocol("WM_DELETE_WINDOW", self.done)
 
         bar = tk.Frame(w, bg=UI["appbar"], height=48)
         bar.pack(fill="x")
         bar.pack_propagate(False)
-        tk.Label(bar, text="✍  Fill & Sign", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left", padx=14)
+        self.tabs = {}
+        for key, label in self.MODES:
+            b = FlatButton(bar, label, lambda k=key: self.set_mode(k), UI["appbar"], fg="#d8d8d8", hover="#4a4a4a",
+                           font=UI["bold"], padx=12, pady=12)
+            b.pack(side="left", padx=(10 if key == "view" else 0, 0))
+            self.tabs[key] = b
         FlatButton(bar, "  Done  ", self.done, UI["appbar"], primary=True, font=UI["bold"], pady=6).pack(
-            side="right", padx=14, pady=8)
+            side="right", padx=(8, 14), pady=8)
         self.page_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["font"])
-        self.page_lbl.pack(side="right", padx=4)
-        FlatButton(bar, "▶", lambda: self.go(1), UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip="Next page").pack(side="right")
-        FlatButton(bar, "◀", lambda: self.go(-1), UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip="Previous page").pack(side="right")
+        nav = [("▶", lambda: self.go(1), "Next page (Page Down)"), (None, None, None),
+               ("◀", lambda: self.go(-1), "Previous page (Page Up)")]
+        for icon, fn, tip in nav:
+            if icon is None:
+                self.page_lbl.pack(side="right", padx=2)
+                continue
+            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip=tip).pack(side="right")
+        tk.Frame(bar, bg="#555555", width=1).pack(side="right", fill="y", padx=8, pady=12)
+        for icon, fn, tip in (("＋", lambda: self.set_zoom(1.25), "Zoom in"), ("Fit", lambda: self.set_zoom(None), "Fit page"),
+                              ("－", lambda: self.set_zoom(0.8), "Zoom out")):
+            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip=tip, padx=7).pack(side="right")
+        self.zoom_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["small"], width=5)
+        self.zoom_lbl.pack(side="right")
+        tk.Frame(bar, bg="#555555", width=1).pack(side="right", fill="y", padx=8, pady=12)
+        self.count_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["small"])
+        self.count_lbl.pack(side="right", padx=(4, 0))
+        FlatButton(bar, "▼", lambda: self.next_match(1), UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+                   tip="Next match (Enter)", padx=5).pack(side="right")
+        FlatButton(bar, "▲", lambda: self.next_match(-1), UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+                   tip="Previous match (Shift+Enter)", padx=5).pack(side="right")
+        self.query = tk.StringVar()
+        self.search_e = tk.Entry(bar, textvariable=self.query, width=20, relief="flat", font=UI["font"],
+                                 bg="#3d3d3d", fg="#ffffff", insertbackground="#ffffff")
+        self.search_e.pack(side="right", ipady=4, pady=11)
+        self.search_e.bind("<Return>", lambda e: self.search())
+        self.search_e.bind("<Shift-Return>", lambda e: self.next_match(-1))
+        tk.Label(bar, text="🔍", bg=UI["appbar"], fg="#d0d0d0", font=UI["font"]).pack(side="right", padx=(0, 4))
 
-        tools = tk.Frame(w, bg=UI["toolbar"], height=46, highlightthickness=1, highlightbackground=UI["border"])
-        tools.pack(fill="x")
-        tools.pack_propagate(False)
-        self.tool_btns = {}
-        for key, icon, tip in self.TOOLS:
-            b = FlatButton(tools, icon, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["icon"], padx=11, tip=tip)
-            b.pack(side="left", padx=(8 if key == "text" else 1, 1), pady=4)
-            self.tool_btns[key] = b
-        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
-        self.sign_btn = FlatButton(tools, "✍  Sign ▾", self.sign_menu, UI["toolbar"], font=UI["bold"],
-                                   tip="Add your signature or initials")
-        self.sign_btn.pack(side="left")
-        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
-        for icon, fn, tip in (("A−", lambda: self.resize(-1), "Smaller"), ("A+", lambda: self.resize(1), "Bigger"),
-                              ("🗑", self.delete_mark, "Delete the selected item (Del)")):
-            FlatButton(tools, icon, fn, UI["toolbar"], font=UI["bold"] if icon != "🗑" else UI["icon"], padx=9,
-                       tip=tip).pack(side="left", padx=1)
-        self.hint = tk.Label(tools, text="", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"])
-        self.hint.pack(side="right", padx=12)
+        self.tools = tk.Frame(w, bg=UI["toolbar"], height=46, highlightthickness=1, highlightbackground=UI["border"])
+        self.tools.pack(fill="x")
+        self.tools.pack_propagate(False)
+        self.banner = tk.Label(w, text="", anchor="w", font=UI["small"], padx=14, pady=5)
 
-        self.canvas = tk.Canvas(w, bg=UI["canvas"], highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        body = tk.Frame(w, bg=UI["canvas"])
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, bg=UI["canvas"], highlightthickness=0)
+        ys = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        xs = ttk.Scrollbar(body, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y")
+        xs.pack(side="bottom", fill="x")
+        self.canvas.pack(side="left", fill="both", expand=True)
         c = self.canvas
-        c.bind("<Configure>", lambda e: self.show())
+        c.bind("<Configure>", lambda e: self.show() if self.zoom == "fit" else None)
         c.bind("<ButtonPress-1>", self.on_press)
         c.bind("<B1-Motion>", self.on_drag)
         c.bind("<ButtonRelease-1>", self.on_release)
         c.bind("<Double-Button-1>", self.on_double)
-        w.bind("<Delete>", lambda e: self.delete_mark() if not isinstance(e.widget, (tk.Entry, ttk.Entry, ttk.Combobox)) else None)
-        w.bind("<Escape>", lambda e: (self.set_tool(None), self.select(None)))
+        c.bind("<Button-2>" if sys.platform == "darwin" else "<Button-3>", self.on_menu)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            c.bind(seq, self.on_wheel)
+        typing = (tk.Entry, ttk.Entry, ttk.Combobox, tk.Text)
+        w.bind("<Delete>", lambda e: self.delete_sel() if not isinstance(e.widget, typing) else None)
+        w.bind("<Escape>", lambda e: (self.set_tool(None), self.select(None), self.clear_selection()))
         w.bind("<Prior>", lambda e: self.go(-1))
         w.bind("<Next>", lambda e: self.go(1))
-        self.set_tool(None)
+        mod = "Command" if sys.platform == "darwin" else "Control"
+        w.bind(f"<{mod}-c>", lambda e: self.copy() if not isinstance(e.widget, typing) else None)
+        w.bind(f"<{mod}-f>", lambda e: (self.search_e.focus_set(), self.search_e.select_range(0, "end")))
+        self.set_mode(mode)
         center_over(w, app.root)
-        w.after(50, self.show)
+        w.after(60, self.show)
 
-    # ---- page & coordinates ---------------------------------------------- #
+    # ---- modes and tools -------------------------------------------------- #
+    def set_mode(self, mode):
+        self.commit_edit()
+        self.mode = mode
+        self.tool = None
+        self.select(None)
+        for k, b in self.tabs.items():
+            on = k == mode
+            b.colors["fg"] = "#ffffff" if on else "#b8b8b8"
+            b.colors["bg"] = "#3d4f6b" if on else UI["appbar"]
+            b.config(fg=b.colors["fg"], bg=b.colors["bg"])
+        for child in self.tools.winfo_children():
+            child.destroy()
+        self.tool_btns = {}
+        t = self.tools
+        if mode == "view":
+            tk.Label(t, text="Drag across text to select it; Ctrl+C copies. Ctrl+F searches.", bg=UI["toolbar"],
+                     fg=UI["muted"], font=UI["font"]).pack(side="left", padx=14)
+            FlatButton(t, "Copy", self.copy, UI["toolbar"], font=UI["bold"], tip="Copy the selected text").pack(side="left")
+        elif mode == "comment":
+            for key, icon, tip in self.COMMENT_TOOLS:
+                b = FlatButton(t, icon, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["icon"], padx=10, tip=tip)
+                b.pack(side="left", padx=(8 if key == "highlight" else 1, 1), pady=4)
+                self.tool_btns[key] = b
+            tk.Frame(t, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+            self.swatches = {}
+            for name, rgb in COMMENT_COLORS.items():
+                sw = tk.Label(t, text="", bg=_hex(rgb), width=2, relief="flat", cursor="hand2", bd=0,
+                              highlightthickness=2, highlightbackground=UI["toolbar"])
+                sw.pack(side="left", padx=2, pady=12)
+                sw.bind("<Button-1>", lambda e, n=name: self.set_color(n))
+                Tooltip(sw, name)
+                self.swatches[name] = sw
+            self.set_color(self.color)
+        elif mode == "fill":
+            for key, icon, tip in self.FILL_TOOLS:
+                b = FlatButton(t, icon, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["icon"], padx=11, tip=tip)
+                b.pack(side="left", padx=(8 if key == "text" else 1, 1), pady=4)
+                self.tool_btns[key] = b
+            tk.Frame(t, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+            self.sign_btn = FlatButton(t, "✍  Sign ▾", self.sign_menu, UI["toolbar"], font=UI["bold"],
+                                       tip="Your signature or initials, or a certificate signature")
+            self.sign_btn.pack(side="left")
+        elif mode == "form":
+            for key, label in self.FORM_TOOLS:
+                b = FlatButton(t, "＋ " + label, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["bold"], padx=9)
+                b.pack(side="left", padx=(8 if key == "text" else 1, 1), pady=4)
+                self.tool_btns[key] = b
+            tk.Frame(t, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+            self.prop = tk.Frame(t, bg=UI["toolbar"])
+            self.prop.pack(side="left", fill="y")
+        if mode in ("comment", "fill"):
+            tk.Frame(t, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+            for icon, fn, tip in (("A−", lambda: self.resize(-1), "Smaller"), ("A+", lambda: self.resize(1), "Bigger")):
+                FlatButton(t, icon, fn, UI["toolbar"], font=UI["bold"], padx=8, tip=tip).pack(side="left")
+        if mode != "view":
+            FlatButton(t, "🗑", self.delete_sel, UI["toolbar"], font=UI["icon"], padx=9,
+                       tip="Delete the selected item (Del)").pack(side="left", padx=1)
+        self.hint = tk.Label(t, text="", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"])
+        self.hint.pack(side="right", padx=12)
+        self.set_tool(None)
+        if hasattr(self, "photo"):
+            self.show()
+
+    def set_tool(self, tool):
+        self.tool = tool
+        for k, b in self.tool_btns.items():
+            b.colors["bg"] = UI["sel_bg"] if k == tool else UI["toolbar"]
+            b.config(bg=b.colors["bg"])
+        text_tools = ("highlight", "underline", "strike")
+        self.canvas.config(cursor="xterm" if (self.mode == "view" or tool in text_tools) else "crosshair" if tool else "")
+        hints = {
+            ("view", None): "",
+            ("comment", None): "Pick a tool and a colour. Click a comment to select it; drag to move it.",
+            ("comment", "highlight"): "Drag across the text to highlight.", ("comment", "underline"): "Drag across the text to underline.",
+            ("comment", "strike"): "Drag across the text to strike it through.", ("comment", "note"): "Click where the note goes.",
+            ("comment", "box"): "Click where the text box starts, then type.", ("comment", "rect"): "Drag to draw a rectangle.",
+            ("comment", "ellipse"): "Drag to draw an ellipse.", ("comment", "arrow"): "Drag from the tail to the point.",
+            ("comment", "ink"): "Draw with the mouse, touchpad or pen.",
+            ("fill", None): "Click a form field to fill it, or choose a tool and click on the page.",
+            ("fill", "text"): "Click where the text should start, then type.", ("fill", "check"): "Click to place a tick.",
+            ("fill", "cross"): "Click to place a cross.", ("fill", "date"): "Click to place today's date.",
+            ("fill", "signature"): "Click where your signature goes.", ("fill", "initials"): "Click where your initials go.",
+            ("fill", "certificate"): "Drag a box where the certificate signature goes.",
+            ("form", None): "Choose a field type, then drag a box on the page (click for a checkbox).",
+        }
+        self.hint.config(text=hints.get((self.mode, tool), "Drag a box on the page." if self.mode == "form" else ""))
+        if self.mode == "form":
+            self.show_props()
+
+    def set_color(self, name):
+        self.color = name
+        for n, sw in self.swatches.items():
+            sw.config(highlightbackground=UI["text"] if n == name else UI["toolbar"])
+        # With a tool picked, the colour is for the next comment; with none, it
+        # recolours the selected one.
+        m = self.selected_mark() if not self.tool else None
+        if m and m["kind"] in COMMENT_KINDS:
+            m["color"] = COMMENT_COLORS[name]
+            self.show()
+
+    def set_zoom(self, factor):
+        if factor is None:
+            self.zoom = "fit"
+        else:
+            self.zoom = max(0.25, min(6.0, (self.s if self.zoom == "fit" else self.zoom) * factor))
+        self.show()
+
+    # ---- page & coordinates ------------------------------------------------- #
     def page(self):
         return self.app.pages[self.k]
 
-    def go(self, step):
+    def go(self, step, to=None):
         self.commit_edit()
-        k = self.k + step
-        if 0 <= k < len(self.app.pages):
+        k = self.k + step if to is None else to
+        if 0 <= k < len(self.app.pages) and k != self.k:
             self.k = k
             self.select(None)
+            self.selection = None
+            self.canvas.yview_moveto(0 if step >= 0 else 1)
             self.show()
 
     def show(self):
-        """Draw the current page, its form fields and its placed items."""
+        """Draw the current page with its fields, comments and placed items."""
         self.commit_edit()
         c = self.canvas
         c.delete("all")
@@ -2753,34 +3494,74 @@ class FillSignWindow:
         doc = self.app.docs[p["doc"]]
         box, R = self.app._page_box(p), self.app._total_rot(p)
         crop = p.get("crop") or box
-        # The visible (cropped) part, in shown coordinates.
         pts = [to_shown(box, R, x, y) for x, y in ((crop[0], crop[1]), (crop[2], crop[3]))]
         self.cx0, self.cy0 = min(q[0] for q in pts), min(q[1] for q in pts)
         cw, ch = abs(pts[1][0] - pts[0][0]), abs(pts[1][1] - pts[0][1])
-        W, H = c.winfo_width(), c.winfo_height()
-        if W < 50 or H < 50:
-            return
-        self.s = min((W - 60) / cw, (H - 40) / ch)
-        self.ox, self.oy = (W - cw * self.s) / 2, (H - ch * self.s) / 2
-        self.vh = ch  # visible height, in points
+        W, H = max(c.winfo_width(), 100), max(c.winfo_height(), 100)
+        fit = min((W - 60) / cw, (H - 40) / ch)
+        self.s = fit if self.zoom == "fit" else self.zoom
+        pw, ph = cw * self.s, ch * self.s
+        self.ox, self.oy = max(30, (W - pw) / 2), max(20, (H - ph) / 2)
+        c.configure(scrollregion=(0, 0, max(W, pw + 60), max(H, ph + 40)))
+        self.vh = ch
         Wf, Hf = shown_size(box, R)
         with PDFIUM_LOCK:
-            pdoc = self.app._pdfium(doc)
-            pg = pdoc[p["index"]]
-            # PDFium crops in shown coordinates too: left, bottom, right, top.
-            im = pg.render(scale=self.s, rotation=p["rot"], may_draw_forms=False,
+            pg = self.app._pdfium(doc)[p["index"]]
+            im = pg.render(scale=self.s, rotation=p["rot"], may_draw_forms=self.mode in ("view", "comment"),
                            crop=(self.cx0, self.cy0, Wf - self.cx0 - cw, Hf - self.cy0 - ch)).to_pil()
             pg.close()
+        highlights = [m for m in self.app.marks.get(p["uid"], []) if m["kind"] == "highlight"]
+        if highlights:
+            # Blend highlights into the page itself (like a real marker), so the
+            # colour is true and the text under it stays crisp.
+            from PIL import ImageChops, ImageDraw
+            layer = Image.new("RGB", im.size, "white")
+            d = ImageDraw.Draw(layer)
+            for m in highlights:
+                for rect in m["rects"]:
+                    x0, y0, x1, y1 = self.canvas_rect(rect)
+                    d.rectangle([x0 - self.ox, y0 - self.oy, x1 - self.ox, y1 - self.oy],
+                                fill=tuple(int(v * 255) for v in m["color"]))
+            im = ImageChops.multiply(im.convert("RGB"), layer)
         self.photo = ImageTk.PhotoImage(im)
-        c.create_rectangle(self.ox + 3, self.oy + 3, self.ox + im.width + 3, self.oy + im.height + 3,
-                           fill="#b9bdc4", outline="")
+        c.create_rectangle(self.ox + 3, self.oy + 3, self.ox + im.width + 3, self.oy + im.height + 3, fill="#b9bdc4", outline="")
         c.create_image(self.ox, self.oy, image=self.photo, anchor="nw")
         self.page_lbl.config(text=f"Page {self.k + 1} of {len(self.app.pages)}")
-        self.draw_fields(p, doc, box, R)
+        self.zoom_lbl.config(text=f"{self.s * 72 / 96 * 100:.0f}%")  # 100% = actual size on a 96 DPI screen
+        self.show_banner(p, doc)
+        if self.mode == "fill":
+            self.draw_fields(p)
+        for f in self.app.new_fields.get(p["uid"], []):
+            self.draw_new_field(f)
+        req = self.app.cert_request
+        if req and req["uid"] == p["uid"]:
+            x0, y0, x1, y1 = self.canvas_rect(req["rect"])
+            c.create_rectangle(x0, y0, x1, y1, outline="#7a3cc8", dash=(5, 3), width=2, tags=("mark", "mcert"))
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=f"Certificate signature\n{req['name']}\n(added when saving)",
+                          fill="#7a3cc8", font=UI["small"], justify="center", tags=("mark", "mcert"))
         for m in self.app.marks.get(p["uid"], []):
             self.draw_mark(m)
+        self.draw_selection()
+        self.draw_matches()
         if self.sel:
             self.select(self.sel)
+
+    def show_banner(self, p, doc):
+        sigs = self.app._signatures(p["doc"])
+        if not sigs:
+            self.banner.pack_forget()
+            return
+        if all(s["intact"] for s in sigs):
+            names = ", ".join(f"{s['name']} ({s['when']})" for s in sigs)
+            text = (f"✔  Certificate-signed by {names}. Unchanged since it was signed. "
+                    "(This app can't confirm who the signer is: check the certificate in a PDF reader.) "
+                    "Saving a new copy here doesn't keep the signature.")
+            bg = "#e7f6ec"
+        else:
+            text = "✖  This document was changed after it was signed, or a signature is damaged."
+            bg = "#fdecea"
+        self.banner.config(text=text, bg=bg, fg=UI["text"], wraplength=1100, justify="left")
+        self.banner.pack(fill="x", after=self.tools)
 
     def to_canvas(self, x, y):
         p = self.page()
@@ -2798,37 +3579,170 @@ class FillSignWindow:
         b = self.to_canvas(rect[2], rect[3])
         return min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])
 
-    # ---- form fields --------------------------------------------------------- #
-    def draw_fields(self, p, doc, box, R):
-        fields = [f for f in self.app._fields(p["doc"]) if f["page"] == p["index"]]
+    def page_rect(self, cx0, cy0, cx1, cy1):
+        a = self.from_canvas(cx0, cy0)
+        b = self.from_canvas(cx1, cy1)
+        return (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
+
+    def on_page(self, cx, cy):
+        return self.ox <= cx <= self.ox + self.photo.width() and self.oy <= cy <= self.oy + self.photo.height()
+
+    def ev(self, e):
+        return self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+
+    # ---- text: selection, copy, search ------------------------------------- #
+    def textpage(self, p=None):
+        p = p or self.page()
+        key = (p["doc"], p["index"])
+        if key not in self.textpages:
+            with PDFIUM_LOCK:
+                pg = self.app._pdfium(self.app.docs[p["doc"]])[p["index"]]
+                self.textpages[key] = (pg, pg.get_textpage())
+        return self.textpages[key][1]
+
+    def char_at(self, cx, cy):
+        x, y = self.from_canvas(cx, cy)
+        tp = self.textpage()
+        with PDFIUM_LOCK:
+            for tol in (2, 6, 14):
+                i = tp.get_index(x, y, tol, tol)
+                if i is not None and i >= 0:
+                    return i
+        return None
+
+    def text_rects(self, start, count, p=None):
+        tp = self.textpage(p)
+        with PDFIUM_LOCK:
+            n = tp.count_rects(start, count)
+            return [tp.get_rect(i) for i in range(n)]
+
+    def clear_selection(self):
+        self.selection = None
+        self.canvas.delete("textsel")
+
+    def draw_selection(self):
+        self.canvas.delete("textsel")
+        if not self.selection or self.selection[0] != self.page()["uid"]:
+            return
+        _, start, count = self.selection
+        for l, b, r, t in self.text_rects(start, count):
+            x0, y0, x1, y1 = self.canvas_rect((l, b, r, t))
+            self.canvas.create_rectangle(x0, y0, x1, y1, fill="#2f74d0", stipple="gray25", outline="", tags="textsel")
+
+    def selected_text(self):
+        if not self.selection or self.selection[0] != self.page()["uid"]:
+            return ""
+        tp = self.textpage()
+        with PDFIUM_LOCK:
+            return tp.get_text_range(self.selection[1], self.selection[2])
+
+    def copy(self):
+        text = self.selected_text()
+        if text:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text.replace("\r\n", "\n"))
+            self.hint.config(text=f"Copied {len(text)} characters.")
+        else:
+            self.hint.config(text="Select some text first: drag across it.")
+
+    def search(self):
+        q = self.query.get().strip()
+        self.matches, self.match_i = [], -1
+        if not q:
+            self.count_lbl.config(text="")
+            self.show()
+            return
+        for k, p in enumerate(self.app.pages):
+            tp = self.textpage(p)
+            with PDFIUM_LOCK:
+                searcher = tp.search(q, match_case=False)
+                while True:
+                    hit = searcher.get_next()
+                    if not hit:
+                        break
+                    self.matches.append((k, hit[0], hit[1]))
+                searcher.close()
+        if not self.matches:
+            self.count_lbl.config(text="No matches")
+            self.show()
+            return
+        # The first match at or after this page.
+        self.match_i = next((i for i, m in enumerate(self.matches) if m[0] >= self.k), 0) - 1
+        self.next_match(1)
+
+    def next_match(self, step):
+        if not self.matches:
+            return self.search() if self.query.get().strip() else None
+        self.match_i = (self.match_i + step) % len(self.matches)
+        k = self.matches[self.match_i][0]
+        self.count_lbl.config(text=f"{self.match_i + 1} of {len(self.matches)}")
+        if k != self.k:
+            self.go(0, to=k)
+        else:
+            self.draw_matches()
+        b = self.canvas.bbox("current_match")
+        if b:  # scroll it into view
+            sr = [float(v) for v in str(self.canvas.cget("scrollregion")).split()]
+            if sr and sr[3] > self.canvas.winfo_height():
+                self.canvas.yview_moveto(max(0, (b[1] - self.canvas.winfo_height() / 3) / sr[3]))
+
+    def draw_matches(self):
+        self.canvas.delete("match")
+        for i, (k, start, count) in enumerate(self.matches):
+            if k != self.k:
+                continue
+            cur = i == self.match_i
+            for l, b, r, t in self.text_rects(start, count):
+                x0, y0, x1, y1 = self.canvas_rect((l, b, r, t))
+                self.canvas.create_rectangle(x0 - 1, y0 - 1, x1 + 1, y1 + 1, fill="#ff9d00" if cur else "#ffd84d",
+                                             stipple="gray50", outline="#e07b00" if cur else "",
+                                             tags=("match", "current_match") if cur else ("match",))
+
+    # ---- form fields (Fill & Sign) ---------------------------------------- #
+    def page_fields(self, p):
+        """The page's fields to fill: the PDF's own, then ones made in Prepare form."""
+        out = [dict(f, new=False) for f in self.app._fields(p["doc"]) if f["page"] == p["index"]]
+        for f in self.app.new_fields.get(p["uid"], []):
+            if f["kind"] != "signature":
+                out.append(dict(name=f["name"], kind=f["kind"], rect=f["rect"], on="Yes", options=f.get("options", []),
+                                value=f.get("value", "" if f["kind"] != "check" else False), readonly=False,
+                                multiline=f.get("multiline", False), new=True, ref=f))
+        return out
+
+    def draw_fields(self, p):
         values = self.app.fill.setdefault(p["doc"], {})
         field_bg = "#dde9fb"
+        fields = self.page_fields(p)
         for f in fields:
-            x0, y0, x1, y1 = self.canvas_rect(f["rect"])
-            w, h = max(8, x1 - x0), max(8, y1 - y0)
-            name = f["name"]
-            current = values.get(name, f["value"] if f["kind"] in ("text", "choice") else
-                                 (f["value"] == f["on"] if f["kind"] == "check" else f["value"]))
             if f["readonly"]:
                 continue
+            x0, y0, x1, y1 = self.canvas_rect(f["rect"])
+            w, h = max(8, x1 - x0), max(8, y1 - y0)
+            if f["new"]:
+                current = f["ref"].get("value", "" if f["kind"] in ("text", "choice") else False)
+            else:
+                current = values.get(f["name"], f["value"] if f["kind"] in ("text", "choice") else
+                                     (f["value"] == f["on"] if f["kind"] == "check" else f["value"]))
+            setter = (lambda v, ref=f["ref"]: ref.__setitem__("value", v)) if f["new"] else \
+                (lambda v, n=f["name"]: self.set_value(n, v))
             if f["kind"] == "text":
-                var = tk.StringVar(value=current)
                 size = -max(9, min(int(h * 0.62), 22)) if not f["multiline"] else -12
                 if f["multiline"]:
                     wdg = tk.Text(self.canvas, bg=field_bg, relief="flat", font=("Helvetica", size), wrap="word",
                                   highlightthickness=1, highlightbackground="#9cb8e6", highlightcolor=UI["accent"])
-                    wdg.insert("1.0", current)
-                    wdg.bind("<KeyRelease>", lambda e, n=name, t=wdg: self.set_value(n, t.get("1.0", "end-1c")))
+                    wdg.insert("1.0", current or "")
+                    wdg.bind("<KeyRelease>", lambda e, t=wdg, s=setter: s(t.get("1.0", "end-1c")))
                 else:
+                    var = tk.StringVar(value=current or "")
                     wdg = tk.Entry(self.canvas, textvariable=var, bg=field_bg, relief="flat", font=("Helvetica", size),
                                    highlightthickness=1, highlightbackground="#9cb8e6", highlightcolor=UI["accent"])
-                    var.trace_add("write", lambda *_, n=name, v=var: self.set_value(n, v.get()))
+                    var.trace_add("write", lambda *_, v=var, s=setter: s(v.get()))
                     wdg.var = var
                 self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=w, height=h)
             elif f["kind"] == "choice":
-                var = tk.StringVar(value=current)
+                var = tk.StringVar(value=current or "")
                 wdg = ttk.Combobox(self.canvas, values=f["options"], textvariable=var)
-                var.trace_add("write", lambda *_, n=name, v=var: self.set_value(n, v.get()))
+                var.trace_add("write", lambda *_, v=var, s=setter: s(v.get()))
                 wdg.var = var
                 self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=max(w, 60), height=h)
             else:
@@ -2839,37 +3753,139 @@ class FillSignWindow:
                 wdg.bind("<Button-1>", lambda e, fld=f: self.toggle(fld))
                 self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=w, height=h)
             self.widgets.append(wdg)
-        if fields:
+        if fields and not self.tool:
             self.hint.config(text="This page has form fields: click one to fill it in.")
-        elif not self.tool:
-            self.hint.config(text="Choose a tool, then click on the page to place it.")
 
     def set_value(self, name, value):
         self.app.fill.setdefault(self.page()["doc"], {})[name] = value
 
     def toggle(self, f):
-        values = self.app.fill.setdefault(self.page()["doc"], {})
-        if f["kind"] == "check":
-            current = values.get(f["name"], f["value"] == f["on"])
-            values[f["name"]] = not current
+        if f["new"]:
+            f["ref"]["value"] = not f["ref"].get("value", False)
         else:
-            current = values.get(f["name"], f["value"])
-            values[f["name"]] = "" if current == f["on"] else f["on"]
+            values = self.app.fill.setdefault(self.page()["doc"], {})
+            if f["kind"] == "check":
+                values[f["name"]] = not values.get(f["name"], f["value"] == f["on"])
+            else:
+                current = values.get(f["name"], f["value"])
+                values[f["name"]] = "" if current == f["on"] else f["on"]
         self.show()
 
-    # ---- placed items -------------------------------------------------------- #
+    # ---- Prepare form ------------------------------------------------------- #
+    def draw_new_field(self, f):
+        if self.mode == "fill" and f["kind"] != "signature":
+            return  # drawn as a fillable widget instead
+        x0, y0, x1, y1 = self.canvas_rect(f["rect"])
+        tag = ("field", f"f{f['id']}")
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#7a3cc8", fill="#efe6fb", stipple="gray25", width=1.5,
+                                     tags=tag)
+        label = {"check": "✓", "choice": f"{f['name']} ▾", "signature": f"✍ {f['name']}"}.get(f["kind"], f["name"])
+        self.canvas.create_text(x0 + 4, (y0 + y1) / 2, text=label, anchor="w", fill="#5b2a99",
+                                font=(UI["family"], -max(8, min(12, int((y1 - y0) * 0.6)))), tags=tag)
+
+    def show_props(self):
+        """Name and options of the selected new field, in the toolbar."""
+        if self.mode != "form" or not getattr(self, "prop", None) or not self.prop.winfo_exists():
+            return  # the toolbar is still being built
+        for child in self.prop.winfo_children():
+            child.destroy()
+        f = self.selected_field()
+        if f is None:
+            return
+        tk.Label(self.prop, text=FIELD_KINDS[f["kind"]] + ":", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"]).pack(
+            side="left", padx=(0, 4))
+        name = tk.StringVar(value=f["name"])
+        e = ttk.Entry(self.prop, textvariable=name, width=16)
+        e.pack(side="left", pady=10)
+        name.trace_add("write", lambda *_: (f.__setitem__("name", name.get().strip() or f["name"]), self.redraw_field(f)))
+        Tooltip(e, "Field name (what the filled-in value is called)")
+        if f["kind"] == "choice":
+            opts = tk.StringVar(value=", ".join(f.get("options", [])))
+            tk.Label(self.prop, text="Options", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"]).pack(side="left", padx=(8, 4))
+            oe = ttk.Entry(self.prop, textvariable=opts, width=26)
+            oe.pack(side="left")
+            opts.trace_add("write", lambda *_: f.__setitem__("options", [o.strip() for o in opts.get().split(",") if o.strip()]))
+            Tooltip(oe, "Separate the choices with commas")
+        if f["kind"] == "text":
+            ml = tk.BooleanVar(value=f.get("multiline", False))
+            ttk.Checkbutton(self.prop, text="Several lines", variable=ml,
+                            command=lambda: f.__setitem__("multiline", ml.get())).pack(side="left", padx=8)
+
+    def redraw_field(self, f):
+        self.canvas.delete(f"f{f['id']}")
+        self.draw_new_field(f)
+        self.select(("field", f["id"]))
+
+    def selected_field(self):
+        if not self.sel or self.sel[0] != "field":
+            return None
+        return next((f for f in self.app.new_fields.get(self.page()["uid"], []) if f["id"] == self.sel[1]), None)
+
+    def add_field(self, kind, rect):
+        fields = self.app.new_fields.setdefault(self.page()["uid"], [])
+        taken = {f["name"] for fs in self.app.new_fields.values() for f in fs}
+        base = {"text": "Text", "check": "Check", "choice": "Dropdown", "signature": "Signature"}[kind]
+        n = 1
+        while f"{base}{n}" in taken:
+            n += 1
+        f = dict(id=self.app._new_mark_id(), kind=kind, name=f"{base}{n}", rect=rect,
+                 options=["Option 1", "Option 2"] if kind == "choice" else [], multiline=False)
+        fields.append(f)
+        self.draw_new_field(f)
+        self.select(("field", f["id"]))
+        self.show_props()
+
+    # ---- placed items and comments ------------------------------------------ #
     def draw_mark(self, m):
         c, s = self.canvas, self.s
-        p = self.page()
-        R = self.app._total_rot(p)
+        R = self.app._total_rot(self.page())
+        tag = ("mark", f"m{m['id']}")
+        kind = m["kind"]
+        col = _hex(m.get("color", (0, 0, 0)))
+        if kind in TEXT_MARKUP:
+            for rect in m["rects"]:
+                x0, y0, x1, y1 = self.canvas_rect(rect)
+                if kind == "highlight":  # the colour is blended into the page in show(); this is for clicking
+                    c.create_rectangle(x0, y0, x1, y1, fill="", outline="", tags=tag)
+                else:
+                    y = y1 - (y1 - y0) * 0.08 if kind == "underline" else (y0 + y1) / 2
+                    c.create_rectangle(x0, y0, x1, y1, fill="", outline="", tags=tag)  # clickable area
+                    c.create_line(x0, y, x1, y, fill=col, width=max(1, (y1 - y0) * 0.08), tags=tag)
+            return
+        if kind == "note":
+            x, y = self.to_canvas(m["x"], m["y"])
+            z = 20 * s
+            c.create_rectangle(x, y, x + z, y + z * 0.8, fill=col, outline="#404040", tags=tag)
+            c.create_text(x + z / 2, y + z * 0.4, text="💬", font=(UI["family"], -max(6, int(z * 0.5))), tags=tag)
+            return
+        if kind in ("rect", "ellipse"):
+            x0, y0, x1, y1 = self.canvas_rect(m["rect"])
+            (c.create_rectangle if kind == "rect" else c.create_oval)(x0, y0, x1, y1, outline=col,
+                                                                        width=max(1, m.get("width", 2) * s), tags=tag)
+            return
+        if kind == "arrow":
+            (x1, y1), (x2, y2) = [self.to_canvas(*p) for p in m["points"]]
+            c.create_line(x1, y1, x2, y2, fill=col, width=max(1, m.get("width", 2) * s), arrow="last",
+                          arrowshape=(10 * s, 12 * s, 4 * s), tags=tag)
+            return
+        if kind == "ink":
+            for stroke in m["strokes"]:
+                pts = [v for p in stroke for v in self.to_canvas(*p)]
+                if len(pts) >= 4:
+                    c.create_line(*pts, fill=col, width=max(1, m.get("width", 2) * s), capstyle="round",
+                                  joinstyle="round", smooth=True, tags=tag)
+            return
         turn = (R - m["rot"]) % 360  # the page was turned after this was placed
         cx, cy = self.to_canvas(m["x"], m["y"])
-        tag = ("mark", f"m{m['id']}")
-        if m["kind"] in ("text", "date"):
-            c.create_text(cx, cy, text=m["text"], font=("Helvetica", -max(4, int(m["size"] * s))), fill="#000000",
-                          angle=-turn, tags=tag)
-        elif m["kind"] in MARK_GLYPHS:
-            c.create_text(cx, cy, text="✔" if m["kind"] == "check" else "✘", fill="#000000",
+        if kind in ("text", "date", "box"):
+            item = c.create_text(cx, cy, text=m["text"], font=("Helvetica", -max(4, int(m["size"] * s))), fill="#000000",
+                                 angle=-turn, tags=tag)
+            if kind == "box":
+                b = c.bbox(item)
+                c.create_rectangle(b[0] - 4 * s, b[1] - 2 * s, b[2] + 4 * s, b[3] + 2 * s, outline=col,
+                                   width=max(1, 1.2 * s), tags=tag)
+        elif kind in MARK_GLYPHS:
+            c.create_text(cx, cy, text="✔" if kind == "check" else "✘", fill="#000000",
                           font=(UI["family"], -max(4, int(m["size"] * s))), angle=-turn, tags=tag)
         else:
             w, h = mark_size(m)
@@ -2880,41 +3896,40 @@ class FillSignWindow:
             m.setdefault("_photos", {})[self.k] = photo  # keep a reference
             c.create_image(cx, cy, image=photo, tags=tag)
 
-    def mark(self, mid):
-        for m in self.app.marks.get(self.page()["uid"], []):
-            if m["id"] == mid:
-                return m
-        return None
+    def marks(self):
+        return self.app.marks.setdefault(self.page()["uid"], [])
 
-    def select(self, mid):
+    def selected_mark(self):
+        if not self.sel or self.sel[0] != "mark":
+            return None
+        return next((m for m in self.marks() if m["id"] == self.sel[1]), None)
+
+    def select(self, sel):
         self.canvas.delete("selbox")
-        self.sel = mid
-        if mid is None or self.mark(mid) is None:
+        self.sel = sel
+        if sel is None:
+            if self.mode == "form":
+                self.show_props()
+            return
+        tag = f"m{sel[1]}" if sel[0] == "mark" else f"f{sel[1]}"
+        b = self.canvas.bbox(tag)
+        if not b:
             self.sel = None
             return
-        b = self.canvas.bbox(f"m{mid}")
-        if b:
-            self.canvas.create_rectangle(b[0] - 4, b[1] - 3, b[2] + 4, b[3] + 3, outline=UI["accent"], dash=(4, 2),
-                                         width=2, tags="selbox")
-
-    def set_tool(self, tool):
-        self.tool = tool
-        for k, b in self.tool_btns.items():
-            b.colors["bg"] = UI["sel_bg"] if k == tool else UI["toolbar"]
-            b.config(bg=b.colors["bg"])
-        self.canvas.config(cursor="crosshair" if tool else "")
-        self.hint.config(text={None: "Choose a tool, then click on the page to place it. Drag items to move them.",
-                               "text": "Click where the text should start, then type.",
-                               "check": "Click to place a tick.", "cross": "Click to place a cross.",
-                               "date": "Click to place today's date.",
-                               "signature": "Click where your signature goes.",
-                               "initials": "Click where your initials go."}[tool])
+        self.canvas.create_rectangle(b[0] - 4, b[1] - 3, b[2] + 4, b[3] + 3, outline=UI["accent"], dash=(4, 2),
+                                     width=2, tags="selbox")
+        if self.mode == "form":
+            self.show_props()
 
     def sign_menu(self):
         menu = tk.Menu(self.win, tearoff=0)
         sig, ini = load_signature("signature"), load_signature("initials")
         menu.add_command(label="Add signature" if sig else "Create signature…", command=lambda: self.use_sig("signature"))
         menu.add_command(label="Add initials" if ini else "Create initials…", command=lambda: self.use_sig("initials"))
+        menu.add_separator()
+        menu.add_command(label="Sign with a certificate…", command=lambda: self.set_tool("certificate"))
+        if self.app.cert_request:
+            menu.add_command(label="Remove the certificate signature", command=self.remove_cert)
         menu.add_separator()
         if sig:
             menu.add_command(label="Change signature…", command=lambda: self.new_sig("signature"))
@@ -2943,34 +3958,65 @@ class FillSignWindow:
         if messagebox.askyesno("Forget signature?", "Delete your saved signature and initials from this computer? "
                                "Ones already placed in documents stay.", parent=self.win):
             forget_signatures()
-            self.app._status("Your saved signature and initials were deleted from this computer.")
+            self.hint.config(text="Your saved signature and initials were deleted from this computer.")
 
-    def add_mark(self, kind, cx, cy, text=None):
-        p = self.page()
-        x, y = self.from_canvas(cx, cy)
-        m = dict(id=self.app._new_mark_id(), kind=kind, x=x, y=y, rot=self.app._total_rot(p), size=12)
-        if kind == "date":
-            m["text"] = time.strftime("%d %b %Y").lstrip("0")
-        elif kind == "text":
-            m["text"] = text or ""
-        elif kind in ("signature", "initials"):
-            m["image"] = self.pending_image
-            m["w"] = 150 if kind == "signature" else 55
-            m["size"] = None
-        elif kind in MARK_GLYPHS:
-            m["size"] = 14
-        self.app.marks.setdefault(p["uid"], []).append(m)
-        if kind == "text":
-            # Text starts at the click: move its centre half its width to the right.
-            self.draw_mark(m)
-            self.edit_text(m, new=True)
-        else:
-            self.draw_mark(m)
-            self.select(m["id"])
+    def remove_cert(self):
+        self.app.cert_request = None
+        self.show()
+
+    def new_mark(self, kind, **kw):
+        m = dict(id=self.app._new_mark_id(), kind=kind, rot=self.app._total_rot(self.page()), **kw)
+        if kind in COMMENT_KINDS:
+            m.setdefault("color", COMMENT_COLORS[self.color])
+            m.setdefault("width", 2)
+        self.marks().append(m)
         return m
 
+    def add_mark(self, kind, cx, cy):
+        x, y = self.from_canvas(cx, cy)
+        if kind == "date":
+            m = self.new_mark(kind, x=x, y=y, size=12, text=time.strftime("%d %b %Y").lstrip("0"))
+        elif kind in ("text", "box"):
+            m = self.new_mark(kind, x=x, y=y, size=12, text="")
+            self.draw_mark(m)
+            self.edit_text(m, new=True)
+            return m
+        elif kind in ("signature", "initials"):
+            m = self.new_mark(kind, x=x, y=y, image=self.pending_image, w=150 if kind == "signature" else 55, size=None)
+        elif kind in MARK_GLYPHS:
+            m = self.new_mark(kind, x=x, y=y, size=14)
+        elif kind == "note":
+            m = self.new_mark(kind, x=x, y=y, text="")
+            self.draw_mark(m)
+            self.edit_note(m, new=True)
+            return m
+        self.draw_mark(m)
+        self.select(("mark", m["id"]))
+        return m
+
+    def edit_note(self, m, new=False):
+        top = tk.Toplevel(self.win)
+        top.title("Note")
+        top.transient(self.win)
+        t = tk.Text(top, width=40, height=7, wrap="word", font=UI["font"], bg=_hex(m["color"]) if False else "#fffbe0")
+        t.pack(padx=10, pady=(10, 4))
+        t.insert("1.0", m.get("text", ""))
+        t.focus_set()
+
+        def ok():
+            m["text"] = t.get("1.0", "end-1c").strip()
+            top.destroy()
+            if not m["text"] and new:
+                self.app.marks[self.page()["uid"]] = [x for x in self.marks() if x["id"] != m["id"]]
+            self.show()
+            if m["text"]:
+                self.select(("mark", m["id"]))
+        ttk.Button(top, text="OK", command=ok).pack(pady=(0, 10))
+        top.bind("<Control-Return>", lambda e: ok())
+        center_over(top, self.win)
+
     def edit_text(self, m, new=False):
-        """Type into a placed text item, in place."""
+        """Type into a placed text item or text box, in place."""
         self.commit_edit()
         cx, cy = self.to_canvas(m["x"], m["y"])
         self.canvas.delete(f"m{m['id']}")
@@ -2999,121 +4045,446 @@ class FillSignWindow:
             e.destroy()
         except tk.TclError:
             pass
-        uid = self.page()["uid"]
         if not text:
-            self.app.marks[uid] = [x for x in self.app.marks.get(uid, []) if x["id"] != m["id"]]
+            self.app.marks[self.page()["uid"]] = [x for x in self.marks() if x["id"] != m["id"]]
             return
         m["text"] = text
         if new:  # placed at the click as its left edge: centre it from there
             w = text_width(text, m["size"]) * self.s
             m["x"], m["y"] = self.from_canvas(x0 + w / 2 + 1, cy)
         self.draw_mark(m)
-        self.select(m["id"])
+        self.select(("mark", m["id"]))
 
     def resize(self, step):
-        m = self.mark(self.sel) if self.sel else None
+        m = self.selected_mark()
         if m is None:
             self.hint.config(text="Select an item on the page first (click it).")
             return
         if m["kind"] in ("signature", "initials"):
             m["w"] = max(20, min(500, m["w"] * (1.15 if step > 0 else 1 / 1.15)))
-        else:
+        elif m["kind"] in SHAPES:
+            m["width"] = max(0.5, min(12, m.get("width", 2) + step))
+        elif m.get("size"):
             m["size"] = max(6, min(72, m["size"] + 2 * step))
         self.show()
 
-    def delete_mark(self):
+    def delete_sel(self):
         if self.sel is None:
             return
         uid = self.page()["uid"]
-        self.app.marks[uid] = [m for m in self.app.marks.get(uid, []) if m["id"] != self.sel]
+        if self.sel[0] == "mark":
+            self.app.marks[uid] = [m for m in self.marks() if m["id"] != self.sel[1]]
+        else:
+            self.app.new_fields[uid] = [f for f in self.app.new_fields.get(uid, []) if f["id"] != self.sel[1]]
         self.sel = None
         self.show()
 
-    # ---- mouse ---------------------------------------------------------------- #
-    def _hit(self, x, y):
-        for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
+    def translate(self, item, dx, dy):
+        """Move a comment, placed item or new field by (dx, dy) points, in page coordinates."""
+        if "x" in item:
+            item["x"] += dx
+            item["y"] += dy
+        if "rects" in item:
+            item["rects"] = [(l + dx, b + dy, r + dx, t + dy) for l, b, r, t in item["rects"]]
+        if "rect" in item:
+            l, b, r, t = item["rect"]
+            item["rect"] = (l + dx, b + dy, r + dx, t + dy)
+        if "points" in item:
+            item["points"] = [(x + dx, y + dy) for x, y in item["points"]]
+        if "strokes" in item:
+            item["strokes"] = [[(x + dx, y + dy) for x, y in s] for s in item["strokes"]]
+
+    # ---- mouse -------------------------------------------------------------- #
+    def _hit(self, cx, cy):
+        for item in reversed(self.canvas.find_overlapping(cx - 3, cy - 3, cx + 3, cy + 3)):
             for t in self.canvas.gettags(item):
-                if t.startswith("m") and t != "mark":
-                    return int(t[1:])
+                if t.startswith("m") and t not in ("mark", "match", "mcert") and t[1:].isdigit():
+                    return ("mark", int(t[1:]))
+                if t.startswith("f") and t != "field" and t[1:].isdigit():
+                    return ("field", int(t[1:]))
         return None
 
     def on_press(self, e):
         self.commit_edit()
         self.canvas.focus_set()
-        hit = self._hit(e.x, e.y)
-        if hit is not None and not self.tool:
+        cx, cy = self.ev(e)
+        self.drag = None
+        hit = self._hit(cx, cy)
+        movable = hit and ((hit[0] == "field" and self.mode == "form") or
+                           (hit[0] == "mark" and self.mode in ("comment", "fill")))
+        if movable and not self.tool:
             self.select(hit)
-            m = self.mark(hit)
-            self.drag = dict(id=hit, x=e.x, y=e.y, start=self.to_canvas(m["x"], m["y"]), moved=False)
+            self.drag = dict(kind="move", x=cx, y=cy, start=self.from_canvas(cx, cy), moved=False)
             return
-        if self.tool:
-            # Only on the page itself.
-            if not (self.ox <= e.x <= self.ox + self.photo.width() and self.oy <= e.y <= self.oy + self.photo.height()):
-                return
-            kind = self.tool
+        if self.mode == "view" or self.tool in TEXT_MARKUP:
+            i = self.char_at(cx, cy)
+            self.clear_selection()
+            if i is not None:
+                self.drag = dict(kind="text", a=i)
+            return
+        if not self.tool or not self.on_page(cx, cy):
+            self.select(None)
+            return
+        tool = self.tool
+        if tool in ("rect", "ellipse", "arrow", "certificate") or (self.mode == "form" and tool != "check"):
+            self.drag = dict(kind="shape", tool=tool, x=cx, y=cy, item=None)
+        elif tool == "ink":
+            self.drag = dict(kind="ink", points=[(cx, cy)], items=[])
+        elif self.mode == "form" and tool == "check":
+            x, y = self.from_canvas(cx, cy)
             self.set_tool(None)
-            self.add_mark(kind, e.x, e.y)
-            return
-        self.select(None)
+            self.add_field("check", (x - 7, y - 7, x + 7, y + 7))
+        else:
+            self.set_tool(None)
+            self.add_mark(tool, cx, cy)
 
     def on_drag(self, e):
         d = self.drag
         if not d:
             return
-        if not d["moved"] and abs(e.x - d["x"]) + abs(e.y - d["y"]) < 3:
-            return
-        d["moved"] = True
-        dx, dy = e.x - d["x"], e.y - d["y"]
-        self.canvas.move(f"m{d['id']}", dx - d.get("dx", 0), dy - d.get("dy", 0))
-        self.canvas.move("selbox", dx - d.get("dx", 0), dy - d.get("dy", 0))
-        d["dx"], d["dy"] = dx, dy
+        cx, cy = self.ev(e)
+        if d["kind"] == "move":
+            if not d["moved"] and abs(cx - d["x"]) + abs(cy - d["y"]) < 3:
+                return
+            d["moved"] = True
+            tag = f"m{self.sel[1]}" if self.sel[0] == "mark" else f"f{self.sel[1]}"
+            self.canvas.move(tag, cx - d["x"], cy - d["y"])
+            self.canvas.move("selbox", cx - d["x"], cy - d["y"])
+            d["x"], d["y"] = cx, cy
+        elif d["kind"] == "text":
+            j = self.char_at(cx, cy)
+            if j is not None:
+                a, b = sorted((d["a"], j))
+                self.selection = (self.page()["uid"], a, b - a + 1)
+                self.draw_selection()
+        elif d["kind"] == "shape":
+            if d["item"]:
+                self.canvas.delete(d["item"])
+            col = _hex(COMMENT_COLORS[self.color]) if self.mode == "comment" else "#7a3cc8"
+            if d["tool"] == "arrow":
+                d["item"] = self.canvas.create_line(d["x"], d["y"], cx, cy, fill=col, width=2, arrow="last")
+            elif d["tool"] == "ellipse":
+                d["item"] = self.canvas.create_oval(d["x"], d["y"], cx, cy, outline=col, width=2)
+            else:
+                d["item"] = self.canvas.create_rectangle(d["x"], d["y"], cx, cy, outline=col, width=2,
+                                                         dash=(4, 2) if self.mode != "comment" else None)
+            d["end"] = (cx, cy)
+        elif d["kind"] == "ink":
+            px, py = d["points"][-1]
+            if abs(cx - px) + abs(cy - py) >= 2:
+                d["points"].append((cx, cy))
+                d["items"].append(self.canvas.create_line(px, py, cx, cy, fill=_hex(COMMENT_COLORS[self.color]),
+                                                          width=max(1, 2 * self.s), capstyle="round"))
 
     def on_release(self, e):
         d, self.drag = self.drag, None
-        if d and d["moved"]:
-            m = self.mark(d["id"])
-            sx, sy = d["start"]
-            m["x"], m["y"] = self.from_canvas(sx + d["dx"], sy + d["dy"])
+        if not d:
+            return
+        if d["kind"] == "move" and d["moved"]:
+            x, y = self.from_canvas(*self.ev(e))
+            item = self.selected_mark() if self.sel[0] == "mark" else self.selected_field()
+            if item is not None:
+                self.translate(item, x - d["start"][0], y - d["start"][1])
+            self.show()
+        elif d["kind"] == "text" and self.selection and self.tool in TEXT_MARKUP:
+            rects = self.text_rects(self.selection[1], self.selection[2])
+            if rects:
+                m = self.new_mark(self.tool, rects=merge_line_rects(rects),
+                                  text=self.selected_text().replace("\r\n", " "))
+                self.clear_selection()
+                self.show()  # highlights are blended into the page; the tool stays on for the next passage
+        elif d["kind"] == "shape" and "end" in d:
+            if d["item"]:
+                self.canvas.delete(d["item"])
+            (x0, y0), (x1, y1) = (d["x"], d["y"]), d["end"]
+            if abs(x1 - x0) + abs(y1 - y0) < 6:
+                return
+            tool = d["tool"]
+            self.set_tool(None)
+            if tool == "arrow":
+                m = self.new_mark("arrow", points=[self.from_canvas(x0, y0), self.from_canvas(x1, y1)])
+                self.draw_mark(m)
+                self.select(("mark", m["id"]))
+            elif tool == "certificate":
+                self.place_certificate(self.page_rect(x0, y0, x1, y1))
+            elif self.mode == "form":
+                self.add_field(tool, self.page_rect(x0, y0, x1, y1))
+            else:
+                m = self.new_mark(tool, rect=self.page_rect(x0, y0, x1, y1))
+                self.draw_mark(m)
+                self.select(("mark", m["id"]))
+        elif d["kind"] == "ink":
+            for it in d["items"]:
+                self.canvas.delete(it)
+            if len(d["points"]) > 1:
+                m = self.new_mark("ink", strokes=[[self.from_canvas(x, y) for x, y in d["points"]]])
+                self.draw_mark(m)
 
     def on_double(self, e):
-        hit = self._hit(e.x, e.y)
-        m = self.mark(hit) if hit is not None else None
-        if m and m["kind"] == "text":
+        hit = self._hit(*self.ev(e))
+        if not hit or hit[0] != "mark":
+            return
+        self.sel = hit
+        m = self.selected_mark()
+        if m and m["kind"] in ("text", "box"):
             self.edit_text(m)
+        elif m and m["kind"] == "note":
+            self.edit_note(m)
+
+    def on_menu(self, e):
+        menu = tk.Menu(self.win, tearoff=0)
+        menu.add_command(label="Copy", command=self.copy, state="normal" if self.selected_text() else "disabled")
+        if self.selected_text():
+            for kind, label in (("highlight", "Highlight"), ("underline", "Underline"), ("strike", "Strike through")):
+                menu.add_command(label=label, command=lambda k=kind: self.markup_selection(k))
+        menu.tk_popup(e.x_root, e.y_root)
+
+    def markup_selection(self, kind):
+        rects = self.text_rects(self.selection[1], self.selection[2])
+        if rects:
+            self.new_mark(kind, rects=merge_line_rects(rects), text=self.selected_text().replace("\r\n", " "))
+            self.clear_selection()
+            self.show()
+
+    def on_wheel(self, e):
+        if sys.platform == "darwin":
+            step = -e.delta
+        elif e.num == 4:
+            step = -1
+        elif e.num == 5:
+            step = 1
+        else:
+            step = -1 if e.delta > 0 else 1
+        top, bottom = self.canvas.yview()
+        if step > 0 and bottom >= 0.999 and self.k < len(self.app.pages) - 1:
+            self.go(1)  # scrolling past the end of a page goes to the next
+        elif step < 0 and top <= 0.001 and self.k > 0:
+            self.go(-1)
+        else:
+            self.canvas.yview_scroll(int(step) * 2, "units")
+
+    # ---- certificate signature ------------------------------------------------ #
+    def place_certificate(self, rect):
+        p = self.page()
+        if self.app._total_rot(p) != 0:
+            messagebox.showinfo("Certificate signature", "Certificate signatures can only be placed on pages "
+                                "that aren't rotated. Turn this page upright first.", parent=self.win)
+            return
+        if (rect[2] - rect[0]) < 60 or (rect[3] - rect[1]) < 25:
+            messagebox.showinfo("Certificate signature", "Draw a bigger box (at least about 2 × 1 cm).", parent=self.win)
+            return
+
+        def done(cert):
+            self.app.cert_request = dict(cert, uid=p["uid"], rect=rect)
+            self.show()
+            self.hint.config(text="The certificate signature is added when you save, as the very last step.")
+        CertificateDialog(self.win, done)
 
     def done(self):
         self.commit_edit()
-        # Drop empty values and empty texts, then record one undo step for the whole session.
         for uid in list(self.app.marks):
-            self.app.marks[uid] = [m for m in self.app.marks[uid] if m["kind"] not in ("text",) or m.get("text")]
+            self.app.marks[uid] = [m for m in self.app.marks[uid] if m["kind"] not in ("text", "box", "note") or m.get("text")]
             if not self.app.marks[uid]:
                 del self.app.marks[uid]
+        with PDFIUM_LOCK:
+            for pg, tp in self.textpages.values():
+                tp.close()
+                pg.close()
         self.app._fill_done(self.before)
         self.win.destroy()
 
 
-class PageViewer:
-    """One page, large, to read it before deciding where it goes."""
-    def __init__(self, app, page):
-        doc = app.docs[page["doc"]]
-        w = tk.Toplevel(app.root)
-        k = next((i for i, p in enumerate(app.pages) if p["uid"] == page["uid"]), 0)
-        w.title(f"Page {k + 1} — {doc.name}, page {page['index'] + 1}")
+def merge_line_rects(rects, tol=2.0):
+    """PDFium gives one rectangle per run of text; join the ones on the same line."""
+    out = []
+    for l, b, r, t in sorted(rects, key=lambda q: (-q[3], q[0])):
+        if out and abs(out[-1][1] - b) < tol and abs(out[-1][3] - t) < tol and l - out[-1][2] < 6:
+            pl, pb, pr, pt = out[-1]
+            out[-1] = (min(pl, l), min(pb, b), max(pr, r), max(pt, t))
+        else:
+            out.append((l, b, r, t))
+    return out
+
+
+class CompareWindow:
+    """Compare two PDFs page by page: what changed in the text, and where on the page."""
+    def __init__(self, app):
+        self.app = app
+        self.results = []
+        self.k = 0
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Compare two PDFs — PDF Toolkit")
+        w.configure(bg=UI["canvas"])
+        sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+        w.geometry(f"{min(1300, sw - 80)}x{min(880, sh - 100)}")
         w.transient(app.root)
-        side = max(400, min(app.root.winfo_screenheight() - 160, 1000))
-        with PDFIUM_LOCK:
-            pg = app._pdfium(doc)[page["index"]]
-            pw, ph = pg.get_size()
-            if page["rot"] in (90, 270):
-                pw, ph = ph, pw
-            scale = side / max(pw, ph)
-            im = pg.render(scale=scale, may_draw_forms=True, rotation=page["rot"], crop=app._render_crop(page)).to_pil()
-            pg.close()
-        self.photo = ImageTk.PhotoImage(im)
-        tk.Label(w, image=self.photo, bg="#6b7280").pack(padx=0, pady=0)
-        w.bind("<Escape>", lambda e: w.destroy())
+        bar = tk.Frame(w, bg=UI["appbar"], height=48)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="⇄  Compare", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left", padx=14)
+        FlatButton(bar, "  Close  ", w.destroy, UI["appbar"], primary=True, font=UI["bold"], pady=6).pack(
+            side="right", padx=14, pady=8)
+        pick = tk.Frame(w, bg=UI["toolbar"], highlightthickness=1, highlightbackground=UI["border"])
+        pick.pack(fill="x")
+        self.a, self.b = tk.StringVar(), tk.StringVar()
+        first = next((d.path for d in app.docs.values() if d.path.lower().endswith(".pdf")), "")
+        self.a.set(first)
+        for row, (label, var) in enumerate((("Original", self.a), ("Changed", self.b))):
+            tk.Label(pick, text=label, bg=UI["toolbar"], font=UI["bold"], width=9, anchor="w").grid(row=row, column=0, padx=(14, 4), pady=4)
+            ttk.Entry(pick, textvariable=var, width=90).grid(row=row, column=1, pady=4, sticky="ew")
+            ttk.Button(pick, text="Choose…", command=lambda v=var: self.choose(v)).grid(row=row, column=2, padx=6)
+        self.go_btn = FlatButton(pick, "  Compare  ", self.run, UI["toolbar"], primary=True, font=UI["bold"], pady=6)
+        self.go_btn.grid(row=0, column=3, rowspan=2, padx=(8, 14))
+        pick.columnconfigure(1, weight=1)
+        self.summary = tk.Label(w, text="Choose the original and the changed version, then click Compare.",
+                                bg=UI["canvas"], fg=UI["text"], font=UI["font"], anchor="w")
+        self.summary.pack(fill="x", padx=14, pady=(8, 4))
+        body = tk.Frame(w, bg=UI["canvas"])
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        left = tk.Frame(body, bg=UI["panel"], width=300, highlightthickness=1, highlightbackground=UI["border"])
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        tk.Label(left, text="Pages", bg=UI["panel"], font=UI["bold"], anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+        self.pages = tk.Listbox(left, height=10, font=UI["font"], activestyle="none", relief="flat",
+                                highlightthickness=0, selectbackground=UI["sel_bg"], selectforeground=UI["text"])
+        self.pages.pack(fill="x", padx=6)
+        self.pages.bind("<<ListboxSelect>>", lambda e: self.show(self.pages.curselection()[0]) if self.pages.curselection() else None)
+        tk.Label(left, text="Text changes on this page", bg=UI["panel"], font=UI["bold"], anchor="w").pack(fill="x", padx=10, pady=(10, 2))
+        self.changes = tk.Text(left, wrap="word", font=UI["small"], relief="flat", bg=UI["panel"], height=20)
+        self.changes.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.changes.tag_configure("removed", foreground="#b42318", overstrike=True)
+        self.changes.tag_configure("added", foreground="#067647")
+        self.view = tk.Canvas(body, bg=UI["canvas"], highlightthickness=0)
+        self.view.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.view.bind("<Configure>", lambda e: self.show(self.k) if self.results else None)
         center_over(w, app.root)
-        w.focus_set()
+
+    def choose(self, var):
+        p = filedialog.askopenfilename(title="Choose a PDF", parent=self.win, filetypes=[("PDF files", "*.pdf")],
+                                       initialdir=self.app.v["last_dir"].get())
+        if p:
+            var.set(p)
+
+    def run(self):
+        a, b = self.a.get().strip(), self.b.get().strip()
+        if not (os.path.isfile(a) and os.path.isfile(b)):
+            messagebox.showwarning("Compare", "Choose two PDF files.", parent=self.win)
+            return
+        self.summary.config(text="Comparing…")
+        self.go_btn.set_enabled(False)
+
+        def ask_pw(path):
+            box = {}
+            ev = threading.Event()
+            self.app.ui(lambda: (box.__setitem__("pw", simpledialog.askstring(
+                "Password needed", f"{os.path.basename(path)} is password-protected.\n\nPassword:", show="•",
+                parent=self.win)), ev.set()))
+            ev.wait()
+            return box.get("pw")
+
+        def open_doc(path):
+            data = open(path, "rb").read()
+            try:
+                with PDFIUM_LOCK:
+                    return pdfium.PdfDocument(data)
+            except pdfium.PdfiumError:
+                pw = ask_pw(path)
+                with PDFIUM_LOCK:
+                    return pdfium.PdfDocument(data, password=pw)
+
+        def work():
+            try:
+                da, db = open_doc(a), open_doc(b)
+                results = []
+                n = max(len(da), len(db))
+                for i in range(n):
+                    r = dict(i=i, a=None, b=None, boxes=[], words=[], status="")
+                    with PDFIUM_LOCK:
+                        ta = da[i].get_textpage().get_text_range() if i < len(da) else ""
+                        tb = db[i].get_textpage().get_text_range() if i < len(db) else ""
+                        if i < len(da):
+                            r["a"] = da[i].render(scale=1.4).to_pil().convert("RGB")
+                        if i < len(db):
+                            r["b"] = db[i].render(scale=1.4).to_pil().convert("RGB")
+                    if r["a"] is None:
+                        r["status"] = "added page"
+                    elif r["b"] is None:
+                        r["status"] = "removed page"
+                    else:
+                        ia, ib = r["a"], r["b"]
+                        if ia.size != ib.size:
+                            ib = ib.resize(ia.size, Image.Resampling.LANCZOS)
+                        r["boxes"] = diff_boxes(ia, ib)
+                        r["scale_b"] = (r["b"].width / ia.width, r["b"].height / ia.height)
+                        r["words"] = word_changes(ta, tb)
+                        r["status"] = (f"{len(r['words'])} text change{'s' * (len(r['words']) != 1)}" if r["words"] else
+                                       f"{len(r['boxes'])} visual change{'s' * (len(r['boxes']) != 1)}" if r["boxes"] else
+                                       "no changes")
+                    results.append(r)
+                with PDFIUM_LOCK:
+                    da.close()
+                    db.close()
+                self.app.ui(lambda: self.done(results))
+            except Exception as e:
+                log_error(f"Compare: {type(e).__name__}: {e}")
+                self.app.ui(lambda e=e: (self.summary.config(text=f"Couldn't compare: {explain_error(e)}"),
+                                         self.go_btn.set_enabled(True)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, results):
+        self.go_btn.set_enabled(True)
+        self.results = results
+        changed = [r for r in results if r["status"] != "no changes"]
+        self.summary.config(text=(f"{len(changed)} of {len(results)} pages differ." if changed else
+                                  f"No differences found in {len(results)} pages.") +
+                            "  Red boxes show where; the list shows the text that changed.")
+        self.pages.delete(0, "end")
+        for r in results:
+            self.pages.insert("end", f"  Page {r['i'] + 1}: {r['status']}")
+            if r["status"] != "no changes":
+                self.pages.itemconfig("end", foreground="#b42318")
+        first = next((r["i"] for r in results if r["status"] != "no changes"), 0)
+        self.pages.selection_set(first)
+        self.show(first)
+
+    def show(self, k):
+        self.k = k
+        r = self.results[k]
+        c = self.view
+        c.delete("all")
+        W, H = c.winfo_width(), c.winfo_height()
+        half = (W - 30) / 2
+        self.photos = []
+        for col, (key, title) in enumerate((("a", "Original"), ("b", "Changed"))):
+            x = 10 + col * (half + 10)
+            c.create_text(x + half / 2, 12, text=title, font=UI["bold"], fill=UI["text"])
+            im = r[key]
+            if im is None:
+                c.create_text(x + half / 2, H / 2, text="(no page)", fill=UI["muted"], font=UI["font"])
+                continue
+            s = min(half / im.width, (H - 40) / im.height)
+            shown = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(shown)
+            self.photos.append(photo)
+            ox, oy = x + (half - shown.width) / 2, 28
+            c.create_image(ox, oy, image=photo, anchor="nw")
+            c.create_rectangle(ox, oy, ox + shown.width, oy + shown.height, outline="#9aa1ab")
+            sx, sy = (1, 1) if key == "a" else r.get("scale_b", (1, 1))
+            for x0, y0, x1, y1 in r["boxes"]:
+                c.create_rectangle(ox + x0 * sx * s, oy + y0 * sy * s, ox + x1 * sx * s, oy + y1 * sy * s,
+                                   outline="#e0442b", width=2)
+        t = self.changes
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        if r["status"] in ("added page", "removed page"):
+            t.insert("end", f"This whole page was {r['status'].split()[0]}.")
+        elif not r["words"]:
+            t.insert("end", "No text changes." + (" Something else changed (pictures, layout or colours): "
+                                                   "see the red boxes." if r["boxes"] else ""))
+        for kind, words in r["words"]:
+            t.insert("end", ("− " if kind == "removed" else "+ "), kind)
+            t.insert("end", words + "\n", kind)
+        t.config(state="disabled")
 
 
 def center_over(win, root):
@@ -3203,6 +4574,25 @@ def self_test():
         doc = pdfium.PdfDocument(buf.getvalue())
         if "Filled in" not in doc[0].get_textpage().get_text_range():
             return 4
+        # Comments, a new form field and a certificate signature.
+        pdf = pikepdf.open(io.BytesIO(image_to_pdf(img, "A4")))
+        page = pdf.pages[0]
+        box, rot = page_boxes(pdf)[0]
+        page.obj.Annots = pikepdf.Array([comment_annotation(pdf, dict(id=3, kind="highlight", color=(1, 1, 0),
+                                                                      rects=[(100, 700, 300, 712)], rot=0), box),
+                                         comment_annotation(pdf, dict(id=4, kind="ink", color=(1, 0, 0), width=2,
+                                                                      strokes=[[(50, 50), (80, 90), (120, 60)]], rot=0), box)])
+        add_form_fields(pdf, page, [dict(id=5, kind="text", name="Name", rect=(100, 500, 300, 520), value="X")], 0)
+        pdf.generate_appearance_streams()
+        unsigned = os.path.join(tmp, "unsigned.pdf")
+        pdf.save(unsigned)
+        cert = create_certificate("Self Test", "", "selftest", os.path.join(tmp, "test.p12"))
+        signed = os.path.join(tmp, "signed.pdf")
+        sign_pdf_file(unsigned, signed, dict(path=cert, password="selftest", page=0, rect=(300, 100, 520, 160),
+                                             reason="Self-test", image=sig))
+        sigs = check_signatures(open(signed, "rb").read())
+        if not (len(sigs) == 1 and sigs[0]["intact"] and sigs[0]["name"] == "Self Test"):
+            return 5
         root = tk.Tk()
         root.withdraw()
         from tkinterdnd2 import TkinterDnD

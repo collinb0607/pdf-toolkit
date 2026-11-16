@@ -2,12 +2,13 @@
 
 **Free, offline alternative to online PDF tools. No "2 free tasks a day", no uploads, no account.**
 
-![PDF Toolkit: organize pages, then fill in a form and sign it](docs/demo.gif)
+![PDF Toolkit: open a contract, search it, highlight and comment, then sign it and save](docs/demo.gif)
 
-Merge, reorder, rotate, crop, delete and extract pages, split, compress, **fill in forms and sign**,
-turn images into a PDF or pages into images, add page numbers, headers and footers, Bates numbers or a
-watermark, and add or remove a password, all in one window that shows every page as a thumbnail.
-Your documents never leave your computer. Works on Windows and macOS.
+Merge, reorder, rotate, crop, delete and extract pages, split, compress, **read and search**,
+**comment and mark up**, **fill in forms and sign** (including **certificate signatures**), **create
+fillable forms**, **compare two PDFs**, turn images into a PDF or pages into images, add page numbers,
+headers and footers, Bates numbers or a watermark, and add or remove a password. Your documents never
+leave your computer. Works on Windows and macOS.
 
 ## Download
 Get the latest version from the [Releases page](https://github.com/collinb0607/pdf-toolkit/releases/latest).
@@ -21,7 +22,9 @@ Nothing else to install.
 On an Intel Mac, or any other system, run it from source with Python (below).
 
 ## How it works
-Open files, arrange the pages, save. The **Tools** panel on the left sets what happens when you save.
+Open files, then use the tabs at the top, as in big-name PDF editors: **Organize** (the page grid),
+**View**, **Comment**, **Fill & Sign**, **Prepare form** and **Compare**. Everything you do is added to
+the PDF when you save; the **Tools** panel on the left sets what else happens when you save.
 
 **Organize pages**
 - **Add files**: drop PDFs, images or whole folders onto the window (they go where you drop them), or
@@ -36,9 +39,21 @@ Open files, arrange the pages, save. The **Tools** panel on the left sets what h
 - Big documents are fine: 800 pages open in a fraction of a second, and thumbnails are drawn as you
   scroll.
 
-**Fill & Sign**
+**View**: read pages large, zoom (or **Fit**), scroll from page to page. **Search** (Ctrl+F) finds
+text in every page and highlights each match. Drag across text to select it; Ctrl+C copies it.
+Double-clicking a page in the grid opens it here.
 
-Select a page and click **✍ Fill & Sign**. The page opens large:
+**Comment**: **highlight**, **underline** or **strike through** text (drag across it), add **sticky
+notes**, **text boxes**, **rectangles**, **ellipses**, **arrows** and **freehand drawing**, in five
+colours. Click a comment to select it, drag to move it, A−/A+ to resize, Delete to remove;
+double-click a note or text box to edit it. They're saved as standard PDF comments, so Acrobat,
+Preview and web browsers show them, and can reply to or change them (or flatten them into the page).
+
+**Prepare form**: turn any PDF into a fillable form. Pick **Text field**, **Checkbox**, **Dropdown**
+or **Signature field** and drag a box on the page; name each field (and type a dropdown's options)
+in the toolbar. Fill & Sign can fill them straight away, and they work in any PDF reader once saved.
+
+**Fill & Sign**: the page opens large:
 - **Form fields** (in fillable PDFs) are highlighted: type into them, tick boxes, pick options.
 - **Type anywhere**, on any PDF, fillable or not: pick **Ab** and click where the text goes. **✓**, **✗**
   and **📅** (today's date) work the same way. Drag anything to move it; **A−**/**A+** resize it; Delete
@@ -52,8 +67,22 @@ Select a page and click **✍ Fill & Sign**. The page opens large:
   and placed text and signatures stay movable in PDF editors). Tick **Flatten when saving** in the
   Tools panel to always flatten without asking.
 
-This is a picture of your signature, like Acrobat's Fill & Sign. It isn't a certificate-based
-digital signature, which proves who signed and that nothing changed since.
+**Certificate signatures**: **Sign ▾ → Sign with a certificate…**, then drag a box. Use your own
+certificate file (.p12 / .pfx, from your employer, a government ID scheme or a certificate
+authority), or create a self-signed one in the app (kept, password-protected, in the same
+`.pdf-toolkit` folder). The signature is added as the very last step of saving, with a visible box
+showing your handwritten signature (if you have one), name, date and reason. Anyone can then check
+that the document hasn't changed since it was signed: changing even one character breaks it. A
+self-signed certificate proves that, but PDF readers will say the signer's identity is unknown: a
+certificate from an authority they trust is what proves who you are.
+
+When you open a PDF that's already certificate-signed, the editor shows who signed it, when, and
+whether it was changed since. Saving creates a new file, which can't keep the original's signature,
+so the app asks first (the original file is never changed).
+
+**Compare**: pick the original and the changed version. Each page shows side by side with red boxes
+where it differs, and the list beside it shows the words removed and added. Pages added or removed
+at the end are listed too.
 
 **Save**
 - **Save as PDF**: every page in the workspace, as one PDF. Saving over one of the files you opened
@@ -88,7 +117,8 @@ When you combine files, each file gets a bookmark with its name, holding its own
 1. Install **Python 3.8+** from https://python.org. On Windows, tick **"Add Python to PATH"** during install.
 2. Run the app (see below). The first time, it asks to install **pikepdf** (edits PDFs, using qpdf),
    **pypdfium2** (draws pages, using Google's PDFium), **Pillow** and **pillow-heif** (images, including
-   HEIC) and **tkinterdnd2** (drag and drop). Click **Yes**; it's about a 25 MB download.
+   HEIC), **pyHanko** (certificate signatures) and **tkinterdnd2** (drag and drop). Click **Yes**; it's
+   about a 40 MB download.
 
 ### Run
 ```
@@ -102,6 +132,11 @@ different one from `python` in a terminal, so it may ask to install the componen
 ## Troubleshooting
 - **Page numbers, headers, typed text or watermark show "?" for some characters:** they use the
   standard Helvetica font built into every PDF reader, which covers Western European letters only.
+- **"Signer's identity is unknown" in Acrobat:** the signature was made with a self-signed
+  certificate. The document is still protected against changes; to prove identity, use a certificate
+  from an authority.
+- **A highlight doesn't work on a scanned page:** scans are pictures of text, with no text to select.
+  Use a rectangle or freehand drawing instead (or run the scan through OCR software first).
 - **A form's fields don't appear in Fill & Sign:** some forms (XFA forms made with Adobe LiveCycle)
   aren't standard PDF fields. Use **Ab** to type on the page instead.
 - **Compress made little difference:** the PDF is mostly text, or its images are already small or in
@@ -112,9 +147,10 @@ different one from `python` in a terminal, so it may ask to install the componen
   On Mac, run `open $TMPDIR/pdf_toolkit_errors.log`.
 
 ## Credits
-Built on [pikepdf](https://github.com/pikepdf/pikepdf) / [qpdf](https://github.com/qpdf/qpdf) and
-[pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / [PDFium](https://pdfium.googlesource.com/pdfium/),
-all under permissive licences (MPL-2.0, Apache-2.0, BSD).
+Built on [pikepdf](https://github.com/pikepdf/pikepdf) / [qpdf](https://github.com/qpdf/qpdf),
+[pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / [PDFium](https://pdfium.googlesource.com/pdfium/)
+and [pyHanko](https://github.com/MatthiasValvekens/pyHanko) (certificate signatures), all under
+permissive licences (MPL-2.0, Apache-2.0, BSD, MIT).
 
 ## Part of the Offline Toolkit
 Also by me: [GIF Maker](https://github.com/collinb0607/gif-maker),
