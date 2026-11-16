@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 PDF Toolkit - a cross-platform (Windows / macOS / Linux) desktop app for the
-PDF jobs websites charge for: merge, reorder, rotate, delete and extract pages,
-split, compress, convert images to PDF and pages to images, add page numbers
-or a watermark, and add or remove a password. Everything stays on your computer.
+PDF jobs websites charge for: merge, reorder, rotate, delete, crop and extract
+pages, split, compress, convert images to PDF and pages to images, fill in
+forms and sign, add page numbers, headers and footers, Bates numbers or a
+watermark, and add or remove a password. Everything stays on your computer.
 
 Pages are shown as thumbnails in one workspace: open PDFs and images, arrange
 the pages, then save. Compression, page numbers, watermark and password are
@@ -58,6 +59,8 @@ COMPRESSION = {
 NUMBER_FORMATS = ["1", "Page 1", "Page 1 of 9", "1 / 9"]
 NUMBER_PLACES = ["Bottom centre", "Bottom right", "Top right"]
 IMAGE_PAGE_SIZES = ["Same size as the image", "A4", "Letter"]
+HF_ALIGN = ["Left", "Centre", "Right"]
+HF_TOKENS = "{page}, {pages}, {date}, {file}, {bates}"
 PAPER = {"A4": (595.28, 841.89), "Letter": (612.0, 792.0)}
 IMAGE_DPI = 150  # page size for images without (sensible) DPI information
 
@@ -166,14 +169,13 @@ class Cancelled(Exception):
 
 
 def open_pdf_bytes(data, password=""):
-    """Check a PDF opens (with the password, if any). Returns its page count.
+    """Check a PDF opens (with the password, if any). Returns each page's (box, rotation).
     Raises PasswordNeeded for a missing or wrong password."""
     try:
         with pikepdf.open(io.BytesIO(data), password=password) as pdf:
-            return len(pdf.pages)
+            return page_boxes(pdf)
     except pikepdf.PasswordError:
         raise PasswordNeeded()
-
 
 def image_to_pdf(path, page_size):
     """Turn an image file into PDF bytes, one page per frame (multi-page TIFFs).
@@ -313,29 +315,29 @@ def text_width(text, size):
     return sum(HELVETICA[ord(c) - 32] if 32 <= ord(c) < 127 else 556 for c in text) * size / 1000
 
 
-def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None):
-    """Add page numbers and/or a diagonal watermark, upright as each page is shown
-    (whatever its rotation), in the standard Helvetica font (no font is embedded)."""
+def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None, header=None, footer=None,
+                align="Centre", bates=None, first_number=0, file_stem=""):
+    """Add page numbers, a header and footer, and/or a diagonal watermark, upright as
+    each page is shown (whatever its rotation), in the standard Helvetica font (no font
+    is embedded). In headers and footers {page} {pages} {date} {file} {bates} are filled
+    in; first_number continues Bates numbers across split files."""
+    import math
     font = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
                                                 BaseFont=pikepdf.Name.Helvetica,
                                                 Encoding=pikepdf.Name.WinAnsiEncoding))
     gs = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.ExtGState, ca=0.22, CA=0.22))
     total = len(pdf.pages)
+    today = time.strftime("%d %b %Y").lstrip("0")
     for i, page in enumerate(pdf.pages):
-        box = [float(v) for v in inherited(page.obj, "/CropBox", None) or inherited(page.obj, "/MediaBox")]
-        x0, y0, x1, y1 = min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3])
-        w, h = x1 - x0, y1 - y0
-        rot = int(inherited(page.obj, "/Rotate", 0)) % 360
+        (x0, y0, x1, y1), rot = page_boxes_one(page)
         # The page as it's shown: width W, height H, and the matrix from those
         # "shown" coordinates to the page's own.
-        W, H = (h, w) if rot in (90, 270) else (w, h)
-        cm = {0: (1, 0, 0, 1, x0, y0), 90: (0, 1, -1, 0, x1, y0),
-              180: (-1, 0, 0, -1, x1, y1), 270: (0, -1, 1, 0, x0, y1)}[rot]
-        ops = [f"q {' '.join(f'{v:.4f}' if isinstance(v, float) else str(v) for v in cm)} cm"]
+        W, H = shown_size((x0, y0, x1, y1), rot)
+        cm = shown_matrix((x0, y0, x1, y1), rot)
+        ops = [f"q {' '.join(f'{v:.4f}' for v in cm)} cm"]
         if watermark:
             size = min(W, H) / max(6, len(watermark) * 0.62)
             tw = text_width(watermark, size)
-            import math
             c, s = math.cos(math.radians(35)), math.sin(math.radians(35))
             # centre the text on the page, turned 35°
             tx = W / 2 - (tw / 2) * c + (size * 0.35) * s
@@ -343,14 +345,28 @@ def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None):
             ops.append(f"q /TKGS gs 0.6 0 0 rg BT /TKHelv {size:.2f} Tf {c:.4f} {s:.4f} {-s:.4f} {c:.4f} "
                        f"{tx:.2f} {ty:.2f} Tm ")
             ops.append(_pdf_text(watermark).decode("latin-1") + " Tj ET Q")
+        margin, size = 24, 10
+        lines = []
         if numbers:
             text = (numbers.replace("9", str(total)).replace("1", str(i + 1), 1)
                     if numbers != "1" else str(i + 1))
-            size = 10
             tw = text_width(text, size)
-            margin = 24
             tx = {"Bottom centre": W / 2 - tw / 2, "Bottom right": W - margin - tw, "Top right": W - margin - tw}[place]
             ty = H - margin - size if place == "Top right" else margin
+            lines.append((text, tx, ty))
+        for text, top in ((header, True), (footer, False)):
+            if not text:
+                continue
+            b = f"{bates['prefix']}{bates['start'] + first_number + i:0{bates['digits']}d}" if bates else ""
+            text = (text.replace("{page}", str(i + 1)).replace("{pages}", str(total)).replace("{date}", today)
+                    .replace("{file}", file_stem).replace("{bates}", b))
+            tw = text_width(text, size)
+            tx = {"Left": margin, "Centre": W / 2 - tw / 2, "Right": W - margin - tw}[align]
+            # Leave room for page numbers in the same corner.
+            ty = (H - margin - size) if top else (margin + (14 if numbers and place != "Top right" and align ==
+                                                             {"Bottom centre": "Centre", "Bottom right": "Right"}.get(place) else 0))
+            lines.append((text, tx, ty))
+        for text, tx, ty in lines:
             ops.append(f"BT 0 g /TKHelv {size} Tf {tx:.2f} {ty:.2f} Td ")
             ops.append(_pdf_text(text).decode("latin-1") + " Tj ET")
         ops.append("Q")
@@ -367,6 +383,381 @@ def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None):
         # Wrap the existing content in q/Q, so whatever state it leaves doesn't affect the stamp.
         page.contents_add(pdf.make_stream(b"q\n"), prepend=True)
         page.contents_add(pdf.make_stream(("\nQ\n" + "\n".join(ops)).encode("latin-1")))
+
+
+def page_boxes_one(page):
+    b = [float(v) for v in (inherited(page.obj, "/CropBox", None) or inherited(page.obj, "/MediaBox"))]
+    return ((min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3])),
+            int(inherited(page.obj, "/Rotate", 0)) % 360)
+
+# ---- page geometry ------------------------------------------------------------ #
+# "Shown" coordinates are the page as you see it after its rotation: points,
+# origin bottom-left. A page's own coordinates are what the PDF stores.
+def shown_matrix(box, rot):
+    """Matrix (a, b, c, d, e, f) from shown coordinates to the page's own, for a page
+    whose visible box is `box` (x0, y0, x1, y1) and which is turned `rot` degrees clockwise."""
+    x0, y0, x1, y1 = box
+    return {0: (1, 0, 0, 1, x0, y0), 90: (0, 1, -1, 0, x1, y0),
+            180: (-1, 0, 0, -1, x1, y1), 270: (0, -1, 1, 0, x0, y1)}[rot % 360]
+
+
+def shown_size(box, rot):
+    w, h = box[2] - box[0], box[3] - box[1]
+    return (h, w) if rot % 180 else (w, h)
+
+
+def to_page(box, rot, X, Y):
+    a, b, c, d, e, f = shown_matrix(box, rot)
+    return a * X + c * Y + e, b * X + d * Y + f
+
+
+def to_shown(box, rot, x, y):
+    a, b, c, d, e, f = shown_matrix(box, rot)
+    x, y = x - e, y - f
+    return a * x + b * y, c * x + d * y  # a rotation's inverse is its transpose
+
+
+def page_boxes(pdf):
+    """Each page's visible box (CropBox, else MediaBox) and own rotation."""
+    out = []
+    for page in pdf.pages:
+        b = [float(v) for v in (inherited(page.obj, "/CropBox", None) or inherited(page.obj, "/MediaBox"))]
+        out.append(((min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3])),
+                    int(inherited(page.obj, "/Rotate", 0)) % 360))
+    return out
+
+
+def blank_pdf(width, height):
+    pdf = pikepdf.new()
+    pdf.add_blank_page(page_size=(width, height))
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+# ---- form fields -------------------------------------------------------------- #
+def _full_name(field):
+    parts, node = [], field
+    for _ in range(32):
+        if "/T" in node:
+            parts.append(str(node.T))
+        if "/Parent" not in node:
+            break
+        node = node.Parent
+    return ".".join(reversed(parts))
+
+
+def _field_of(widget):
+    """The field a widget belongs to (the widget itself when they're merged)."""
+    node = widget
+    for _ in range(32):
+        if "/FT" in node or "/Parent" not in node:
+            return node
+        node = node.Parent
+    return node
+
+
+def read_fields(pdf):
+    """Every fillable widget, page by page: dicts with name, kind, page, rect, on, options, value."""
+    out = []
+    for i, page in enumerate(pdf.pages):
+        for annot in page.obj.get("/Annots", []):
+            try:
+                if annot.get("/Subtype") != pikepdf.Name.Widget:
+                    continue
+                field = _field_of(annot)
+                ft = inherited(field, "/FT")
+                ff = int(inherited(field, "/Ff", 0))
+                r = [float(v) for v in annot.Rect]
+                rect = (min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3]))
+                states = [str(k)[1:] for k in annot.AP.N.keys() if k != "/Off"] if "/AP" in annot and \
+                    isinstance(annot.AP.get("/N"), pikepdf.Dictionary) else []
+                value = inherited(field, "/V")
+                if ft == pikepdf.Name.Tx:
+                    kind = "text"
+                elif ft == pikepdf.Name.Ch:
+                    kind = "choice"
+                elif ft == pikepdf.Name.Btn:
+                    if ff & (1 << 16):
+                        continue  # a push button: nothing to fill
+                    kind = "radio" if ff & (1 << 15) else "check"
+                else:
+                    continue  # signature fields and others
+                opts = []
+                for o in inherited(field, "/Opt", []) or []:
+                    opts.append(str(o[1] if isinstance(o, pikepdf.Array) else o))
+                if kind in ("text", "choice"):
+                    value = str(value) if value is not None else ""
+                else:
+                    value = str(value)[1:] if isinstance(value, pikepdf.Name) and value != pikepdf.Name.Off else ""
+                out.append(dict(name=_full_name(field), kind=kind, page=i, rect=rect, on=states[0] if states else "Yes",
+                                options=opts, value=value, readonly=bool(ff & 1), multiline=bool(ff & (1 << 12))))
+            except Exception as e:
+                log_error(f"Form field: {type(e).__name__}: {e}")
+    return out
+
+
+def apply_fill(pdf, values):
+    """Set form field values: text/choice -> str, checkbox -> bool, radio -> the chosen state name."""
+    if "/AcroForm" not in pdf.Root or not values:
+        return
+    done = set()
+    for page in pdf.pages:
+        for annot in page.obj.get("/Annots", []):
+            if annot.get("/Subtype") != pikepdf.Name.Widget:
+                continue
+            field = _field_of(annot)
+            name = _full_name(field)
+            if name not in values:
+                continue
+            v = values[name]
+            ft = inherited(field, "/FT")
+            if ft in (pikepdf.Name.Tx, pikepdf.Name.Ch):
+                if name not in done:
+                    field.V = pikepdf.String(v)
+                    if "/AP" in annot and ft == pikepdf.Name.Tx:
+                        del annot["/AP"]  # stale picture of the old value; a new one is generated
+            elif ft == pikepdf.Name.Btn:
+                states = [pikepdf.Name(k) for k in annot.AP.N.keys() if k != "/Off"] if "/AP" in annot else \
+                    [pikepdf.Name.Yes]
+                if isinstance(v, bool):  # checkbox
+                    on = states[0] if states else pikepdf.Name.Yes
+                    field.V = on if v else pikepdf.Name.Off
+                    annot.AS = on if v else pikepdf.Name.Off
+                else:  # radio: this widget is on if it's the chosen option
+                    chosen = pikepdf.Name("/" + v) if v else pikepdf.Name.Off
+                    field.V = chosen
+                    annot.AS = chosen if chosen in states else pikepdf.Name.Off
+            done.add(name)
+    pdf.Root.AcroForm.NeedAppearances = True
+
+
+# ---- bookmarks ---------------------------------------------------------------- #
+def _dest_page(src, item, names):
+    """The page object an outline item points to, or None."""
+    dest = item.destination
+    if dest is None and item.action is not None and item.action.get("/S") == pikepdf.Name.GoTo:
+        dest = item.action.get("/D")
+    if isinstance(dest, (pikepdf.String, pikepdf.Name)):
+        dest = names.get(str(dest).lstrip("/"))
+        if isinstance(dest, pikepdf.Dictionary):
+            dest = dest.get("/D")
+    if isinstance(dest, pikepdf.Array) and len(dest) and isinstance(dest[0], pikepdf.Dictionary):
+        return dest[0]
+    return None
+
+
+def _named_dests(src):
+    names = {}
+    try:
+        if "/Names" in src.Root and "/Dests" in src.Root.Names:
+            for k, v in pikepdf.NameTree(src.Root.Names.Dests).items():
+                names[str(k)] = v
+        if "/Dests" in src.Root:
+            for k, v in src.Root.Dests.items():
+                names[str(k).lstrip("/")] = v
+    except Exception as e:
+        log_error(f"Named destinations: {type(e).__name__}: {e}")
+    return names
+
+
+def copy_bookmarks(out, used, opened, docs):
+    """Rebuild the bookmarks for the pages that were kept.
+
+    used: [(doc id, source page index, output page index)] in output order. One
+    file keeps its bookmarks as they were; when files are combined, each gets
+    a bookmark with its name holding its own (as PDF editors do)."""
+    order = []
+    first = {}
+    where = {}
+    for doc_id, si, oi in used:
+        if doc_id not in first:
+            order.append(doc_id)
+            first[doc_id] = oi
+        where.setdefault((doc_id, si), oi)
+    tops = []
+    for doc_id in order:
+        src = opened[doc_id]
+        items = []
+        try:
+            index = {pg.obj.objgen: i for i, pg in enumerate(src.pages)}
+            names = _named_dests(src)
+
+            def convert(nodes):
+                res = []
+                for node in nodes:
+                    kids = convert(node.children)
+                    page = _dest_page(src, node, names)
+                    oi = where.get((doc_id, index.get(page.objgen))) if page is not None else None
+                    if oi is None:
+                        res.extend(kids)  # its page was removed: keep what's under it
+                        continue
+                    item = pikepdf.OutlineItem(str(node.title), oi)
+                    item.children.extend(kids)
+                    res.append(item)
+                return res
+            with src.open_outline() as ol:
+                items = convert(ol.root)
+        except Exception as e:
+            log_error(f"Bookmarks of {docs[doc_id].name}: {type(e).__name__}: {e}")
+        if len(order) > 1:
+            if not docs[doc_id].path:  # an inserted blank page: no bookmark of its own
+                tops.extend(items)
+                continue
+            top = pikepdf.OutlineItem(os.path.splitext(docs[doc_id].name)[0], first[doc_id])
+            top.children.extend(items)
+            tops.append(top)
+        else:
+            tops.extend(items)
+    if tops:
+        with out.open_outline() as ol:
+            ol.root.extend(tops)
+
+
+# ---- placed text, marks and signatures -------------------------------------- #
+INK = (16, 24, 40)  # the colour of drawn and typed signatures
+SIG_DIR = os.path.join(os.path.expanduser("~"), ".pdf-toolkit")
+
+
+def signature_path(kind):
+    return os.path.join(SIG_DIR, f"{kind}.png")
+
+
+def load_signature(kind):
+    try:
+        with Image.open(signature_path(kind)) as im:
+            return im.convert("RGBA")
+    except (OSError, ValueError):
+        return None
+
+
+def save_signature(kind, im):
+    os.makedirs(SIG_DIR, exist_ok=True)
+    im.save(signature_path(kind))
+
+
+def forget_signatures():
+    for kind in ("signature", "initials"):
+        try:
+            os.remove(signature_path(kind))
+        except OSError:
+            pass
+
+
+def handwriting_fonts():
+    """Handwriting-style fonts installed on this computer: {name: path}."""
+    if sys.platform == "win32":
+        base = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        candidates = [("Segoe Script", "segoesc.ttf"), ("Ink Free", "Inkfree.ttf"),
+                      ("Lucida Handwriting", "LHANDW.TTF"), ("Bradley Hand", "BRADHITC.TTF"),
+                      ("Freestyle Script", "FREESCPT.TTF")]
+    elif sys.platform == "darwin":
+        base = "/System/Library/Fonts/Supplemental"
+        candidates = [("Snell Roundhand", "SnellRoundhand.ttc"), ("Bradley Hand", "Bradley Hand Bold.ttf"),
+                      ("Apple Chancery", "Apple Chancery.ttf"), ("Noteworthy", "Noteworthy.ttc"),
+                      ("Chalkboard", "Chalkboard.ttc")]
+    else:
+        base = "/usr/share/fonts/truetype"
+        candidates = [("URW Chancery", "urw-base35/Z003-MediumItalic.ttf"), ("DejaVu Serif Italic",
+                                                                             "dejavu/DejaVuSerif-Italic.ttf")]
+    return {name: os.path.join(base, f) for name, f in candidates if os.path.exists(os.path.join(base, f))}
+
+
+def typed_signature(text, font_path):
+    """A typed name in a handwriting font, as a transparent image cropped to the ink."""
+    from PIL import ImageDraw, ImageFont
+    font = ImageFont.truetype(font_path, 120) if font_path else ImageFont.load_default()
+    l, t, r, b = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox((0, 0), text, font=font)
+    im = Image.new("RGBA", (r - l + 40, b - t + 40), (0, 0, 0, 0))
+    ImageDraw.Draw(im).text((20 - l, 20 - t), text, font=font, fill=INK + (255,))
+    return im.crop(im.getbbox()) if im.getbbox() else im
+
+
+def drawn_signature(strokes, size):
+    """Mouse strokes (lists of (x, y) in a box of `size`) as a smooth transparent image."""
+    from PIL import ImageDraw
+    k = 3  # draw big and shrink, for smooth edges
+    im = Image.new("RGBA", (size[0] * k, size[1] * k), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    for s in strokes:
+        pts = [(x * k, y * k) for x, y in s]
+        if len(pts) == 1:
+            x, y = pts[0]
+            d.ellipse([x - 4 * k, y - 4 * k, x + 4 * k, y + 4 * k], fill=INK + (255,))
+        else:
+            d.line(pts, fill=INK + (255,), width=3 * k, joint="curve")
+            for x, y in (pts[0], pts[-1]):
+                d.ellipse([x - 1.5 * k, y - 1.5 * k, x + 1.5 * k, y + 1.5 * k], fill=INK + (255,))
+    im = im.resize(size, Image.Resampling.LANCZOS)
+    box = im.getbbox()
+    return im.crop((max(0, box[0] - 4), max(0, box[1] - 4), box[2] + 4, box[3] + 4)) if box else None
+
+
+MARK_GLYPHS = {"check": "4", "cross": "8"}  # ✔ and ✘ in the standard ZapfDingbats font
+
+
+def mark_size(m):
+    """A placed item's width and height in points (as created, before any later page turn)."""
+    if m["kind"] in ("text", "date"):
+        return text_width(m["text"], m["size"]) + 2, m["size"] * 1.25
+    if m["kind"] in MARK_GLYPHS:
+        return m["size"] * 0.9, m["size"]
+    return m["w"], m["w"] * m["image"].height / m["image"].width
+
+
+def mark_annotation(pdf, m, box):
+    """A placed item as a PDF annotation: typed text as FreeText (still editable in
+    PDF editors), marks and signatures as a Stamp. Each has its own appearance, so
+    it looks the same everywhere, and can be flattened into the page."""
+    w, h = mark_size(m)
+    a, b, c, d, _, _ = shown_matrix(box, m["rot"])
+    ex, ey = (h / 2, w / 2) if m["rot"] % 180 else (w / 2, h / 2)
+    rect = [m["x"] - ex, m["y"] - ey, m["x"] + ex, m["y"] + ey]
+    res = pikepdf.Dictionary()
+    if m["kind"] in ("text", "date"):
+        res.Font = pikepdf.Dictionary(Helv=pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Name.WinAnsiEncoding)))
+        ops = (f"q BT 0 g /Helv {m['size']:.2f} Tf 1 {m['size'] * 0.27:.2f} Td ".encode()
+               + _pdf_text(m["text"]) + b" Tj ET Q")
+    elif m["kind"] in MARK_GLYPHS:
+        res.Font = pikepdf.Dictionary(ZaDb=pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.ZapfDingbats)))
+        ops = f"q BT 0 g /ZaDb {m['size']:.2f} Tf 0 {m['size'] * 0.18:.2f} Td ({MARK_GLYPHS[m['kind']]}) Tj ET Q".encode()
+    else:
+        im = m["image"]
+        xo = pdf.make_stream(zlib.compress(im.convert("RGB").tobytes(), 6), Type=pikepdf.Name.XObject,
+                             Subtype=pikepdf.Name.Image, Width=im.width, Height=im.height,
+                             ColorSpace=pikepdf.Name.DeviceRGB, BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
+        xo.SMask = pdf.make_stream(zlib.compress(im.getchannel("A").tobytes(), 6), Type=pikepdf.Name.XObject,
+                                   Subtype=pikepdf.Name.Image, Width=im.width, Height=im.height,
+                                   ColorSpace=pikepdf.Name.DeviceGray, BitsPerComponent=8,
+                                   Filter=pikepdf.Name.FlateDecode)
+        res.XObject = pikepdf.Dictionary(Sig=xo)
+        ops = f"q {w:.3f} 0 0 {h:.3f} 0 0 cm /Sig Do Q".encode()
+    ap = pdf.make_stream(ops, Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, BBox=[0, 0, w, h],
+                         Matrix=[a, b, c, d, 0, 0], Resources=res)
+    annot = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Rect=rect, F=4, AP=pikepdf.Dictionary(N=ap),
+                               NM=pikepdf.String(f"pdftoolkit-{m['id']}"))
+    if m["kind"] in ("text", "date"):
+        annot.Subtype = pikepdf.Name.FreeText
+        annot.Contents = pikepdf.String(m["text"])
+        annot.DA = pikepdf.String(f"/Helv {m['size']:.1f} Tf 0 g")
+    else:
+        annot.Subtype = pikepdf.Name.Stamp
+        annot.Name = pikepdf.Name("/" + ("Signature" if m["kind"] in ("signature", "initials") else "Approved"))
+    return pdf.make_indirect(annot)
+
+
+def auto_trim(pil_image, threshold=245, pad=0.01):
+    """Margins (left, top, right, bottom) as fractions, around whatever isn't white."""
+    g = pil_image.convert("L").point(lambda v: 255 if v < threshold else 0)
+    box = g.getbbox()
+    if not box:
+        return None
+    w, h = pil_image.size
+    return (max(0.0, box[0] / w - pad), max(0.0, box[1] / h - pad),
+            max(0.0, 1 - box[2] / w - pad), max(0.0, 1 - box[3] / h - pad))
 
 
 def explain_error(e):
@@ -414,9 +805,11 @@ def enable_drag_and_drop(root, widgets, on_drop):
 class Doc:
     """One opened file. Its PDF bytes are kept in memory, so the original file
     can be moved or even overwritten by Save without breaking the workspace."""
-    def __init__(self, path, data, password, pages):
-        self.path, self.data, self.password, self.pages = path, data, password, pages
-        self.name = os.path.basename(path)
+    def __init__(self, path, data, password, boxes, name=None):
+        self.path, self.data, self.password = path, data, password
+        self.boxes = boxes  # each page's (visible box, own rotation)
+        self.pages = len(boxes)
+        self.name = name or os.path.basename(path)
         self.render = None  # pypdfium2 document, opened on the render thread
 
 
@@ -489,6 +882,11 @@ class ToolkitApp:
         self.selected = set()  # uids
         self.anchor = None  # uid for shift-click ranges
         self.undo_stack, self.redo_stack = [], []
+        self.marks = {}  # page uid -> items placed with Fill & Sign
+        self.fill = {}  # doc id -> {form field name: value}
+        self.field_cache = {}  # doc id -> its form fields
+        self.docinfo = {}  # title, author… for the saved PDF (empty = keep the original's)
+        self.mark_seq = 0
         self.dirty = False
         self.busy = False
         self.cancelled = False
@@ -517,6 +915,13 @@ class ToolkitApp:
             "protect": tk.BooleanVar(value=False),
             "password": tk.StringVar(value=""),
             "image_size": tk.StringVar(value=IMAGE_PAGE_SIZES[0]),
+            "header": tk.StringVar(value=""),
+            "footer": tk.StringVar(value=""),
+            "hf_align": tk.StringVar(value="Centre"),
+            "bates_prefix": tk.StringVar(value=""),
+            "bates_start": tk.StringVar(value="1"),
+            "bates_digits": tk.StringVar(value="6"),
+            "flatten": tk.BooleanVar(value=False),
             "last_dir": tk.StringVar(value=docs_dir if os.path.isdir(docs_dir) else home),
         }
         self._style()
@@ -601,14 +1006,39 @@ class ToolkitApp:
         self.open_btn = FlatButton(bar, "＋  Add files", self.add_files, UI["appbar"], fg="#ffffff",
                                    hover="#4a4a4a", pady=6, tip="Add PDFs or images (or drag them in)")
         self.open_btn.pack(side="right", pady=8)
+        self.print_btn = FlatButton(bar, "🖨  Print", self.print_pdf, UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+                                    pady=6, tip="Opens the finished PDF in your PDF reader to print")
+        self.print_btn.pack(side="right", pady=8)
 
         body = tk.Frame(root, bg=UI["canvas"])
         body.pack(fill="both", expand=True)
 
         # Left: the tools panel.
-        side = tk.Frame(body, bg=UI["panel"], width=292, highlightthickness=1, highlightbackground=UI["border"])
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
+        outer = tk.Frame(body, bg=UI["panel"], width=300, highlightthickness=1, highlightbackground=UI["border"])
+        outer.pack(side="left", fill="y")
+        outer.pack_propagate(False)
+        # The panel scrolls when the window is too short to show every tool.
+        sc = tk.Canvas(outer, bg=UI["panel"], highlightthickness=0, width=284)
+        ssb = ttk.Scrollbar(outer, orient="vertical", command=sc.yview)
+        sc.configure(yscrollcommand=ssb.set)
+        sc.pack(side="left", fill="both", expand=True)
+        side = tk.Frame(sc, bg=UI["panel"])
+        sc.create_window(0, 0, window=side, anchor="nw", width=284)
+
+        def fit(_e=None):
+            sc.configure(scrollregion=(0, 0, 284, side.winfo_reqheight() + 10))
+            if side.winfo_reqheight() > sc.winfo_height():
+                ssb.pack(side="right", fill="y")
+            else:
+                ssb.pack_forget()
+        side.bind("<Configure>", fit)
+        sc.bind("<Configure>", fit)
+
+        def wheel(e):
+            if side.winfo_reqheight() > sc.winfo_height():
+                sc.yview_scroll(-1 if (getattr(e, "delta", 0) > 0 or e.num == 4) else 1, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            sc.bind_all(seq, lambda e: wheel(e) if str(e.widget).startswith(str(outer)) else None, add="+")
         tk.Label(side, text="Tools", bg=UI["panel"], fg=UI["text"], font=UI["heading"], anchor="w").pack(
             fill="x", padx=16, pady=(14, 4))
         tk.Label(side, text="These apply when you save, split or extract.", bg=UI["panel"], fg=UI["muted"],
@@ -645,8 +1075,34 @@ class ToolkitApp:
                         style="Side.TCheckbutton").pack(anchor="w")
         self.pw_e = ttk.Entry(f, textvariable=self.v["password"], width=31, show="•")
         self.pw_e.pack(anchor="w", pady=(2, 0))
-        ttk.Label(f, text="Off = saved without a password (this also\nremoves one from a PDF you opened).",
-                  style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Label(f, text="Off = saved without a password (this also removes one from a PDF you opened).",
+                  style="Hint.TLabel", wraplength=205).pack(anchor="w", pady=(2, 0))
+        f = card("Header & footer", "▤")
+        for label, key in (("Header", "header"), ("Footer", "footer")):
+            row = tk.Frame(f, bg=UI["panel"])
+            row.pack(anchor="w", pady=1)
+            ttk.Label(row, text=label, style="Side.TLabel", width=7).pack(side="left")
+            ttk.Entry(row, textvariable=self.v[key], width=23).pack(side="left")
+        row = tk.Frame(f, bg=UI["panel"])
+        row.pack(anchor="w", pady=1)
+        ttk.Label(row, text="Align", style="Side.TLabel", width=7).pack(side="left")
+        ttk.Combobox(row, values=HF_ALIGN, textvariable=self.v["hf_align"], state="readonly", width=8).pack(side="left")
+        ttk.Label(f, text="Use " + HF_TOKENS + ". For example: {file} — page {page} of {pages}",
+                  style="Hint.TLabel", wraplength=205).pack(anchor="w", pady=(2, 0))
+        row = tk.Frame(f, bg=UI["panel"])
+        row.pack(anchor="w", pady=(4, 0))
+        ttk.Label(row, text="Bates", style="Side.TLabel", width=7).pack(side="left")
+        ttk.Entry(row, textvariable=self.v["bates_prefix"], width=8).pack(side="left")
+        ttk.Label(row, text=" from ", style="Side.TLabel").pack(side="left")
+        ttk.Entry(row, textvariable=self.v["bates_start"], width=6).pack(side="left")
+        ttk.Label(f, text="Prefix and first number for {bates}: ACME- from 1 gives ACME-000001, ACME-000002…",
+                  style="Hint.TLabel", wraplength=205).pack(anchor="w", pady=(2, 0))
+        f = card("Forms & signatures", "✍")
+        ttk.Checkbutton(f, text="Flatten when saving", variable=self.v["flatten"],
+                        style="Side.TCheckbutton").pack(anchor="w")
+        ttk.Label(f, text="Makes filled-in fields, signatures and comments part of the page, so they can't be "
+                          "changed. Off: asks each time something was filled in.", style="Hint.TLabel",
+                  wraplength=205).pack(anchor="w")
         f = card("Images to PDF", "📥")
         ttk.Label(f, text="Added images become pages:", style="Side.TLabel").pack(anchor="w")
         ttk.Combobox(f, values=IMAGE_PAGE_SIZES, textvariable=self.v["image_size"], state="readonly",
@@ -654,13 +1110,14 @@ class ToolkitApp:
 
         tk.Frame(side, bg=UI["border"], height=1).pack(fill="x", padx=16, pady=(16, 8))
         self.action_btns = []
-        for text, cmd, tip in (("✂  Split into several PDFs…", self.split, "Every page, every N pages, or at chosen pages"),
+        for text, cmd, tip in (("ⓘ  Document properties…", lambda: PropertiesDialog(self), "Title, author, subject, keywords"),
+                               ("✂  Split into several PDFs…", self.split, "Every page, every N pages, or at chosen pages"),
                                ("📄  Save selected pages…", self.extract, "Save only the selected pages as a new PDF"),
                                ("🖼  Export pages as images…", self.export_images, "PNG or JPG, at the resolution you choose")):
             btn = FlatButton(side, text, cmd, UI["panel"], hover=UI["hover"], anchor="w", tip=tip)
             btn.pack(fill="x", padx=10)
             self.action_btns.append(btn)
-        self.extract_btn = self.action_btns[1]
+        self.extract_btn = self.action_btns[2]
 
         # Right: toolbar + page grid + status bar.
         main = tk.Frame(body, bg=UI["canvas"])
@@ -675,6 +1132,8 @@ class ToolkitApp:
                                ("⟳", lambda: self.rotate(90), "Rotate right"),
                                ("⧉", self.duplicate, "Duplicate (Ctrl+D)"),
                                ("🗑", self.delete, "Delete (Del)"),
+                               ("📄", self.insert_blank, "Insert a blank page after the selection"),
+                               ("⛶", self.crop, "Crop the selected pages, or trim their white margins"),
                                ("|", None, None),
                                ("↶", self.undo, "Undo (Ctrl+Z)"),
                                ("↷", self.redo, "Redo (Ctrl+Y)")):
@@ -685,12 +1144,20 @@ class ToolkitApp:
             btn.pack(side="left", padx=1)
             self.tool_btns.append(btn)
         self.undo_btn, self.redo_btn = self.tool_btns[-2], self.tool_btns[-1]
+        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=6, pady=9)
+        self.sign_btn = FlatButton(tools, "✍  Fill & Sign", self.fill_sign, UI["toolbar"], font=UI["bold"],
+                                   tip="Fill in forms, add text, ticks, the date and your signature")
+        self.sign_btn.pack(side="left")
+        self.tool_btns.append(self.sign_btn)
         self.clear_btn = FlatButton(tools, "Clear all", self.clear_all, UI["toolbar"], tip="Empty the workspace")
         self.clear_btn.pack(side="right", padx=(0, 10))
-        tk.Label(tools, text="🔍", bg=UI["toolbar"], fg=UI["muted"], font=UI["font"]).pack(side="right", padx=(10, 0))
-        ttk.Scale(tools, from_=90, to=260, variable=self.zoom, orient="horizontal", length=110,
-                  style="Zoom.Horizontal.TScale", command=lambda v: self._on_zoom()).pack(side="right")
-        tk.Label(tools, text="Page size", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"]).pack(side="right", padx=6)
+        zoom_icon = tk.Label(tools, text="🔍", bg=UI["toolbar"], fg=UI["muted"], font=UI["font"])
+        zoom_icon.pack(side="right", padx=(6, 0))
+        Tooltip(zoom_icon, "Thumbnail size")
+        zoom = ttk.Scale(tools, from_=90, to=260, variable=self.zoom, orient="horizontal", length=100,
+                         style="Zoom.Horizontal.TScale", command=lambda v: self._on_zoom())
+        zoom.pack(side="right", padx=(6, 0))
+        Tooltip(zoom, "Thumbnail size")
 
         status = tk.Frame(main, bg=UI["statusbar"], height=30, highlightthickness=1, highlightbackground=UI["border"])
         status.pack(side="bottom", fill="x")
@@ -725,6 +1192,7 @@ class ToolkitApp:
                  bg=UI["canvas"], fg=UI["muted"], font=UI["font"], justify="center").pack(pady=(14, 8))
         FlatButton(self.empty, "  Choose files  ", self.add_files, UI["canvas"], primary=True,
                    font=UI["bold"], pady=6).pack()
+        tk.Frame(side, bg=UI["panel"], height=14).pack()
 
         c = self.canvas
         c.bind("<Configure>", lambda e: self._redraw())
@@ -744,7 +1212,9 @@ class ToolkitApp:
         root.bind(f"<{mod}-s>", lambda e: (self.save_all(), "break")[1])
         self.menu = tk.Menu(root, tearoff=0)
         for label, cmd in (("Rotate left", lambda: self.rotate(-90)), ("Rotate right", lambda: self.rotate(90)),
-                           ("Duplicate", self.duplicate), ("Delete", self.delete), (None, None),
+                           ("Duplicate", self.duplicate), ("Delete", self.delete), ("Crop…", self.crop),
+                           ("Insert blank page after", self.insert_blank), (None, None),
+                           ("Fill & Sign this page", self.fill_sign),
                            ("View larger", self.view_selected), ("Save selected pages as PDF…", self.extract),
                            ("Export selected pages as images…", lambda: self.export_images(selected_only=True)),
                            (None, None), ("Select all", self.select_all)):
@@ -807,9 +1277,7 @@ class ToolkitApp:
             doc = self.docs[key[0]]
             try:
                 with PDFIUM_LOCK:
-                    if doc.render is None:
-                        doc.render = pdfium.PdfDocument(doc.data, password=doc.password or None)
-                    page = doc.render[key[1]]
+                    page = self._pdfium(doc)[key[1]]
                     w, h = page.get_size()  # already turned by the page's own rotation
                     scale = RENDER_PX / max(w, h, 1)
                     im = page.render(scale=scale, may_draw_forms=True).to_pil()
@@ -837,10 +1305,21 @@ class ToolkitApp:
         if im is None:
             return None
         size = int(self.zoom.get())
-        pkey = key + (page["rot"], size)
+        crop = page.get("crop")
+        pkey = key + (page["rot"], size, crop)
         if pkey not in self.photos:
-            shown = im.rotate(-page["rot"], expand=True) if page["rot"] else im  # PIL turns anticlockwise
-            shown = shown.copy()
+            shown = im
+            if crop:
+                # The crop in the thumbnail's own orientation (the page's rotation, before ours).
+                doc = self.docs[page["doc"]]
+                box, base = doc.boxes[page["index"]]
+                W, H = shown_size(box, base)
+                pts = [to_shown(box, base, x, y) for x, y in ((crop[0], crop[1]), (crop[2], crop[3]))]
+                X0, X1 = sorted(q[0] for q in pts)
+                Y0, Y1 = sorted(q[1] for q in pts)
+                sx, sy = im.width / W, im.height / H
+                shown = im.crop((int(X0 * sx), int((H - Y1) * sy), int(X1 * sx), int((H - Y0) * sy)))
+            shown = shown.rotate(-page["rot"], expand=True) if page["rot"] else shown.copy()  # PIL turns anticlockwise
             shown.thumbnail((size, size), Image.Resampling.LANCZOS)
             self.photos[pkey] = ImageTk.PhotoImage(shown)
         return self.photos[pkey]
@@ -943,6 +1422,11 @@ class ToolkitApp:
         it["img"] = c.create_image(cx, cy, image=photo)
         it["extra"].append(c.create_rectangle(cx - pw / 2, cy - ph / 2, cx + pw / 2, cy + ph / 2,
                                               outline="#9aa1ab"))
+        if self._has_fill(page):  # a badge on pages that were filled in or signed
+            bx, by = cx + pw / 2 - 4, cy - ph / 2 + 4
+            it["extra"].append(c.create_oval(bx - 12, by - 12, bx + 12, by + 12, fill=UI["accent"], outline="#ffffff",
+                                             width=2))
+            it["extra"].append(c.create_text(bx, by, text="✍", fill="#ffffff", font=UI["small"]))
         return True
 
     def _yview(self, *args):
@@ -972,8 +1456,9 @@ class ToolkitApp:
         for btn in self.tool_btns + [self.open_btn, self.clear_btn]:
             btn.set_enabled(idle)
         self.undo_btn.set_enabled(bool(self.undo_stack) and idle)
+        self.sign_btn.set_enabled(bool(n) and idle)
         self.redo_btn.set_enabled(bool(self.redo_stack) and idle)
-        for btn in self.action_btns + [self.save_btn]:
+        for btn in self.action_btns + [self.save_btn, self.print_btn]:
             btn.set_enabled(bool(n) and idle)
         self.extract_btn.set_enabled(bool(self.selected) and idle)
 
@@ -1120,7 +1605,7 @@ class ToolkitApp:
 
     # ---- editing (with undo) -------------------------------------------- #
     def _change(self, new_pages, message):
-        self.undo_stack.append((list(self.pages), set(self.selected)))
+        self.undo_stack.append(self._snapshot())
         del self.undo_stack[:-200]
         self.redo_stack.clear()
         self.pages = new_pages
@@ -1128,6 +1613,39 @@ class ToolkitApp:
         self.dirty = True
         self._redraw()
         self._status(message)
+
+    def _snapshot(self):
+        return (list(self.pages), set(self.selected), self._fill_state())
+
+    def _restore(self, snap):
+        self.pages, self.selected, (marks, fill) = snap[0], snap[1], snap[2]
+        self.marks = {u: [dict(m) for m in ms] for u, ms in marks.items()}
+        self.fill = {d: dict(v) for d, v in fill.items()}
+
+    def _fill_state(self):
+        return ({u: [dict(m) for m in ms] for u, ms in self.marks.items()}, {d: dict(v) for d, v in self.fill.items()})
+
+    def _fill_done(self, before):
+        """Fill & Sign closed: one undo step for everything done in it."""
+        after = self._fill_state()
+        strip = lambda st: ({u: [{k: v for k, v in m.items() if k != "_photos"} for m in ms] for u, ms in st[0].items()},
+                            {d: {k: v for k, v in vals.items()} for d, vals in st[1].items() if vals})  # noqa: E731
+        if strip(after) != strip(before):
+            self.undo_stack.append((list(self.pages), set(self.selected), before))
+            self.redo_stack.clear()
+            self.dirty = True
+            n = sum(len(v) for v in self.marks.values())
+            f = sum(len(v) for v in self.fill.values())
+            self._status(f"Filled in: {f} form field value{'s' * (f != 1)}, {n} placed item{'s' * (n != 1)}. "
+                         "They're added when you save.")
+        self._redraw()
+
+    def _has_fill(self, page):
+        if self.marks.get(page["uid"]):
+            return True
+        vals = self.fill.get(page["doc"])
+        return bool(vals) and any(f["page"] == page["index"] and f["name"] in vals
+                                  for f in self.field_cache.get(page["doc"], []))
 
     def _targets(self):
         sel = [p for p in self.pages if p["uid"] in self.selected]
@@ -1152,6 +1670,8 @@ class ToolkitApp:
                 c = dict(p, uid=self.next_uid)
                 self.next_uid += 1
                 new.append(c)
+                if self.marks.get(p["uid"]):  # a copy keeps what was placed on the page
+                    self.marks[c["uid"]] = [dict(m, id=self._new_mark_id()) for m in self.marks[p["uid"]]]
                 copies.add(c["uid"])
         n = len(copies)
         self._change(new, f"Duplicated {n} page{'s' * (n != 1)}.")
@@ -1170,8 +1690,8 @@ class ToolkitApp:
     def undo(self):
         if self.busy or not self.undo_stack:
             return
-        self.redo_stack.append((list(self.pages), set(self.selected)))
-        self.pages, self.selected = self.undo_stack.pop()
+        self.redo_stack.append(self._snapshot())
+        self._restore(self.undo_stack.pop())
         self.dirty = True
         self._redraw()
         self._status("Undone.")
@@ -1179,8 +1699,8 @@ class ToolkitApp:
     def redo(self):
         if self.busy or not self.redo_stack:
             return
-        self.undo_stack.append((list(self.pages), set(self.selected)))
-        self.pages, self.selected = self.redo_stack.pop()
+        self.undo_stack.append(self._snapshot())
+        self._restore(self.redo_stack.pop())
         self.dirty = True
         self._redraw()
         self._status("Redone.")
@@ -1192,6 +1712,7 @@ class ToolkitApp:
                                                   "Changes that haven't been saved are lost."):
             return
         self.pages, self.selected, self.undo_stack, self.redo_stack = [], set(), [], []
+        self.marks, self.fill, self.field_cache, self.docinfo = {}, {}, {}, {}
         with PDFIUM_LOCK:
             for doc in self.docs.values():
                 if doc.render is not None:
@@ -1202,6 +1723,140 @@ class ToolkitApp:
         self.dirty = False
         self._redraw()
         self._status("Ready.")
+
+
+    # ---- page geometry, crop, blank pages ------------------------------- #
+    def _page_box(self, p):
+        return self.docs[p["doc"]].boxes[p["index"]][0]
+
+    def _total_rot(self, p):
+        return (self.docs[p["doc"]].boxes[p["index"]][1] + p["rot"]) % 360
+
+    def _shown_margins_to_box(self, p, left, bottom, right, top):
+        """Margins (points) on the page as shown -> a crop box in the page's own coordinates."""
+        box, R = self._page_box(p), self._total_rot(p)
+        W, H = shown_size(box, R)
+        a = to_page(box, R, left, bottom)
+        b = to_page(box, R, W - right, H - top)
+        return (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
+
+    def _render_crop(self, p):
+        """The page's crop as PDFium wants it: (left, bottom, right, top) to cut off, as shown."""
+        crop = p.get("crop")
+        if not crop:
+            return (0, 0, 0, 0)
+        box, R = self._page_box(p), self._total_rot(p)
+        W, H = shown_size(box, R)
+        pts = [to_shown(box, R, x, y) for x, y in ((crop[0], crop[1]), (crop[2], crop[3]))]
+        X0, X1 = sorted(q[0] for q in pts)
+        Y0, Y1 = sorted(q[1] for q in pts)
+        return (X0, Y0, W - X1, H - Y1)
+
+    def _set_crops(self, crops, message):
+        new = []
+        for p in self.pages:
+            if p["uid"] in crops:
+                q = {k: v for k, v in p.items() if k != "crop"}
+                if crops[p["uid"]]:
+                    q["crop"] = crops[p["uid"]]
+                new.append(q)
+            else:
+                new.append(p)
+        self._change(new, message)
+
+    def crop(self):
+        if self.busy or not self._targets():
+            return
+        CropDialog(self, [p for p in self.pages if p["uid"] in self.selected])
+
+    def insert_blank(self):
+        if self.busy:
+            return
+        slot = self._insert_slot()
+        ref = self.pages[slot - 1] if slot and self.pages else None
+        if ref is not None:  # the same size as the page before it, as it's shown
+            w, h = shown_size(self._page_box(ref), self._total_rot(ref))
+        else:
+            w, h = PAPER["Letter"]
+        data = blank_pdf(round(w, 2), round(h, 2))
+        did = self.next_doc
+        self.next_doc += 1
+        self.docs[did] = Doc("", data, "", open_pdf_bytes(data), name="Blank page")
+        p = dict(uid=self.next_uid, doc=did, index=0, rot=0)
+        self.next_uid += 1
+        self._change(self.pages[:slot] + [p] + self.pages[slot:], "Inserted a blank page.")
+        self.selected = {p["uid"]}
+        self._refresh_selection()
+
+    def _pdfium(self, doc):
+        """The document opened in PDFium, with form fields drawn. Call with PDFIUM_LOCK held."""
+        if doc.render is None:
+            doc.render = pdfium.PdfDocument(doc.data, password=doc.password or None)
+            try:
+                doc.render.init_forms()
+            except Exception:
+                pass  # forms just won't be drawn
+        return doc.render
+
+    # ---- Fill & Sign --------------------------------------------------- #
+    def _fields(self, doc_id):
+        if doc_id not in self.field_cache:
+            doc = self.docs[doc_id]
+            try:
+                with pikepdf.open(io.BytesIO(doc.data), password=doc.password) as pdf:
+                    self.field_cache[doc_id] = read_fields(pdf)
+            except Exception as e:
+                log_error(f"Read fields of {doc.name}: {type(e).__name__}: {e}")
+                self.field_cache[doc_id] = []
+        return self.field_cache[doc_id]
+
+    def _new_mark_id(self):
+        self.mark_seq += 1
+        return self.mark_seq
+
+    def fill_sign(self):
+        if self.busy or not self.pages:
+            return
+        ks = [k for k, p in enumerate(self.pages) if p["uid"] in self.selected]
+        FillSignWindow(self, ks[0] if ks else 0)
+
+    def _source_info(self):
+        first = self.docs[self.pages[0]["doc"]] if self.pages else None
+        if not first or not first.data:
+            return {}
+        try:
+            with pikepdf.open(io.BytesIO(first.data), password=first.password) as pdf:
+                return {k: str(pdf.docinfo[k]) for k, _ in PropertiesDialog.FIELDS if k in pdf.docinfo}
+        except Exception:
+            return {}
+
+    def _ask_flatten(self, pages, o):
+        """Decide whether to flatten. Asks when something was filled in or placed and the
+        Tools panel doesn't already say. Returns True, False, or None to stop."""
+        if o["flatten"]:
+            return True
+        if not any(self._has_fill(p) for p in pages):
+            return False
+        answer = messagebox.askyesnocancel(
+            "Flatten the filled-in parts?",
+            "Make the filled-in fields, text and signatures part of the page?\n\n"
+            "Yes = flatten: nobody can change or move them (best for a signed document).\n"
+            "No = keep them editable: they can still be changed in a PDF editor.")
+        return answer
+
+    def print_pdf(self):
+        """Print: build the finished PDF and open it in the computer's PDF reader."""
+        if self.busy or not self.pages:
+            return
+        o = self._options()
+        if o is None:
+            return
+        o["flatten"] = self._ask_flatten(self.pages, o)
+        if o["flatten"] is None:
+            return
+        o["password"] = None  # a reader asking for a password just to print would be odd
+        path = os.path.join(tempfile.gettempdir(), f"PDF Toolkit print {time.strftime('%H%M%S')}.pdf")
+        self._run_save([(list(self.pages), path)], o, open_after=True)
 
     # ---- adding files --------------------------------------------------- #
     def add_files(self):
@@ -1253,20 +1908,20 @@ class ToolkitApp:
                         with open(path, "rb") as f:
                             data = f.read()
                         try:
-                            pages = open_pdf_bytes(data)
+                            boxes = open_pdf_bytes(data)
                             password = ""
                         except PasswordNeeded:
-                            password, pages = self._ask_password(path, data)
+                            password, boxes = self._ask_password(path, data)
                             if password is None:
                                 problems.append(f"{os.path.basename(path)}: skipped (no password)")
                                 continue
                     elif ext in IMAGE_EXTS:
                         data, password = image_to_pdf(path, size), ""
-                        pages = open_pdf_bytes(data)
+                        boxes = open_pdf_bytes(data)
                     else:
                         problems.append(f"{os.path.basename(path)}: not a PDF or an image")
                         continue
-                    opened.append(Doc(path, data, password, pages))
+                    opened.append(Doc(path, data, password, boxes))
                 except Exception as e:
                     log_error(f"Open {path}: {type(e).__name__}: {e}")
                     problems.append(f"{os.path.basename(path)}: {explain_error(e)}")
@@ -1275,7 +1930,7 @@ class ToolkitApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _ask_password(self, path, data):
-        """Ask (on the UI thread) for a PDF's password, up to 3 tries. Returns (password, pages) or (None, 0)."""
+        """Ask (on the UI thread) for a PDF's password, up to 3 tries. Returns (password, boxes) or (None, 0)."""
         for attempt in range(3):
             answer = {}
             done = threading.Event()
@@ -1328,7 +1983,20 @@ class ToolkitApp:
                  numbers=self.v["number_fmt"].get() if self.v["numbers"].get() else None,
                  place=self.v["number_place"].get(),
                  watermark=self.v["watermark_text"].get().strip() if self.v["watermark"].get() else None,
-                 password=self.v["password"].get() if self.v["protect"].get() else None)
+                 password=self.v["password"].get() if self.v["protect"].get() else None,
+                 header=self.v["header"].get().strip() or None, footer=self.v["footer"].get().strip() or None,
+                 align=self.v["hf_align"].get(), flatten=self.v["flatten"].get(), info=dict(self.docinfo))
+        o["bates"] = None
+        if "{bates}" in (o["header"] or "") + (o["footer"] or ""):
+            try:
+                start = int(self.v["bates_start"].get())
+                if start < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Check settings", "The first Bates number must be a whole number.")
+                return None
+            o["bates"] = dict(prefix=self.v["bates_prefix"].get(), start=start,
+                              digits=max(1, min(12, int(self.v["bates_digits"].get() or 6))))
         if self.v["watermark"].get() and not o["watermark"]:
             messagebox.showwarning("Check settings", "Type the watermark text, or untick Watermark.")
             return None
@@ -1359,7 +2027,10 @@ class ToolkitApp:
         o = self._options()
         if o is None:
             return
-        path = self._ask_save(self.pages, " (edited)")
+        o["flatten"] = self._ask_flatten(self.pages, o)
+        if o["flatten"] is None:
+            return
+        path = self._ask_save(self.pages, " (signed)" if self.marks else " (edited)")
         if path:
             self._run_save([(list(self.pages), path)], o, mark_clean=True)
 
@@ -1373,6 +2044,9 @@ class ToolkitApp:
         o = self._options()
         if o is None:
             return
+        o["flatten"] = self._ask_flatten(pages, o)
+        if o["flatten"] is None:
+            return
         path = self._ask_save(pages, " (pages)")
         if path:
             self._run_save([(pages, path)], o)
@@ -1383,23 +2057,41 @@ class ToolkitApp:
         o = self._options()
         if o is None:
             return
+        o["flatten"] = self._ask_flatten(self.pages, o)
+        if o["flatten"] is None:
+            return
         SplitDialog(self, o)
 
-    def _build_pdf(self, pages, o, check_cancel, opened):
-        """Assemble the pages into a new PDF and apply the options. Returns a pikepdf.Pdf."""
+    def _build_pdf(self, pages, o, check_cancel, opened, first_number=0, file_stem=""):
+        """Assemble the pages into a new PDF and apply everything. Returns a pikepdf.Pdf."""
         out = pikepdf.new()
-        forms = []
+        forms, used = [], []
+        filled = False
         for p in pages:
             check_cancel()
             src = opened.get(p["doc"])
             if src is None:
                 doc = self.docs[p["doc"]]
                 src = opened[p["doc"]] = pikepdf.open(io.BytesIO(doc.data), password=doc.password)
+                if self.fill.get(p["doc"]):
+                    apply_fill(src, self.fill[p["doc"]])
+            filled = filled or bool(self.fill.get(p["doc"]))
             spage = src.pages[p["index"]]
             # The page's own rotation (it may be inherited from the page tree), plus ours.
             base = int(inherited(spage.obj, "/Rotate", 0))
             out.pages.append(spage)
-            out.pages[-1].obj.Rotate = (base + p["rot"]) % 360
+            page = out.pages[-1]
+            page.obj.Rotate = (base + p["rot"]) % 360
+            if p.get("crop"):
+                page.obj.CropBox = pikepdf.Array([round(v, 3) for v in p["crop"]])
+            marks = self.marks.get(p["uid"])
+            if marks:
+                # A new list, so a duplicated page's annotations aren't shared with its twin.
+                annots = pikepdf.Array(list(page.obj.get("/Annots", [])))
+                for m in marks:
+                    annots.append(mark_annotation(out, m, self._page_box(p)))
+                page.obj.Annots = annots
+            used.append((p["doc"], p["index"], len(out.pages) - 1))
             if "/AcroForm" in src.Root and src not in forms:
                 forms.append(src)
         # Keep form fields working: their document-level list goes along too.
@@ -1413,28 +2105,48 @@ class ToolkitApp:
                         out.Root.AcroForm.Fields.append(out.copy_foreign(field))
             except Exception as e:
                 log_error(f"Form fields: {type(e).__name__}: {e}")
+        if filled and "/AcroForm" in out.Root:
+            out.Root.AcroForm.NeedAppearances = True
+            try:
+                out.generate_appearance_streams()  # so filled values show everywhere, and can be flattened
+            except Exception as e:
+                log_error(f"Field appearances: {type(e).__name__}: {e}")
+        copy_bookmarks(out, used, opened, self.docs)
+        # Document properties: the ones set in the app, else the original's title (one file only).
         first = opened.get(pages[0]["doc"])
         if first is not None and "/Title" in first.docinfo and len({p["doc"] for p in pages}) == 1:
             out.docinfo["/Title"] = first.docinfo["/Title"]
+        for k, v in (o.get("info") or {}).items():
+            if v:
+                out.docinfo[k] = v
+            elif k in out.docinfo:
+                del out.docinfo[k]
+        if o.get("flatten"):
+            out.flatten_annotations("all")
+            if "/AcroForm" in out.Root:
+                del out.Root["/AcroForm"]
         if o["compress"]:
             compress_images(out, o["compress"]["max_side"], o["compress"]["quality"], check_cancel)
-        if o["numbers"] or o["watermark"]:
-            stamp_pages(out, o["numbers"], o["place"], o["watermark"])
+        if o["numbers"] or o["watermark"] or o.get("header") or o.get("footer"):
+            stamp_pages(out, o["numbers"], o["place"], o["watermark"], o.get("header"), o.get("footer"),
+                        o.get("align", "Centre"), o.get("bates"), first_number, file_stem)
         return out
 
-    def _run_save(self, jobs, o, mark_clean=False):
+    def _run_save(self, jobs, o, mark_clean=False, open_after=False):
         """Save each (pages, path) job in the background."""
         names = [os.path.normcase(os.path.abspath(path)) for _, path in jobs]
         self._set_busy(True)
         self._status("Saving…")
 
         def work():
-            opened, written, total_in = {}, [], 0
+            opened, written, done_pages = {}, [], 0
             try:
                 for k, (pages, path) in enumerate(jobs):
                     self.ui(lambda k=k: (self.progress.config(value=k / len(jobs) * 1000),
                                          self._status(f"Saving {os.path.basename(jobs[k][1])}…")))
-                    out = self._build_pdf(pages, o, self._check_cancel, opened)
+                    out = self._build_pdf(pages, o, self._check_cancel, opened, done_pages,
+                                          os.path.splitext(os.path.basename(path))[0])
+                    done_pages += len(pages)
                     self._check_cancel()
                     kw = dict(compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
                     if o["compress"]:
@@ -1450,7 +2162,7 @@ class ToolkitApp:
                         if os.path.exists(part):
                             os.remove(part)
                     written.append(path)
-                self.ui(lambda: self._saved(written, jobs, mark_clean))
+                self.ui(lambda: self._saved(written, jobs, mark_clean, open_after))
             except Cancelled:
                 self.ui(lambda: self._save_failed("Cancelled." + (f" {len(written)} file(s) were saved." if written else "")))
             except Exception as e:
@@ -1461,8 +2173,12 @@ class ToolkitApp:
                     src.close()
         threading.Thread(target=work, daemon=True).start()
 
-    def _saved(self, written, jobs, mark_clean):
+    def _saved(self, written, jobs, mark_clean, open_after=False):
         self._set_busy(False)
+        if open_after:
+            open_file(written[0])
+            self._status("Opened in your PDF reader: print from there (Ctrl+P, or ⌘P on a Mac).")
+            return
         if mark_clean:
             self.dirty = False
             self._update_title()
@@ -1501,11 +2217,9 @@ class ToolkitApp:
                                          self._status(f"Exporting page {k + 1} of {len(pages)}…")))
                     doc = self.docs[p["doc"]]
                     with PDFIUM_LOCK:
-                        if doc.render is None:
-                            doc.render = pdfium.PdfDocument(doc.data, password=doc.password or None)
-                        page = doc.render[p["index"]]
-                        im = page.render(scale=dpi / 72, may_draw_forms=True,
-                                         rotation=p["rot"] % 360).to_pil()
+                        page = self._pdfium(doc)[p["index"]]
+                        im = page.render(scale=dpi / 72, may_draw_forms=True, rotation=p["rot"] % 360,
+                                         crop=self._render_crop(p)).to_pil()
                         page.close()
                     name = f"{stem} page {k + 1:0{len(str(len(pages)))}d}.{fmt}"
                     path = os.path.join(folder, name)
@@ -1717,6 +2431,667 @@ class ExportDialog:
         self.app._run_export(self.pages, folder, "jpg" if self.fmt.get().startswith("JPG") else "png", dpi)
 
 
+class SignatureDialog:
+    """Create a signature or initials: draw it, or type it in a handwriting font."""
+    def __init__(self, parent, kind, on_done):
+        self.kind, self.on_done, self.strokes = kind, on_done, []
+        w = self.win = tk.Toplevel(parent)
+        w.title("Create your " + ("signature" if kind == "signature" else "initials"))
+        w.transient(parent)
+        w.resizable(False, False)
+        w.configure(bg=UI["panel"])
+        f = tk.Frame(w, bg=UI["panel"], padx=16, pady=14)
+        f.pack(fill="both", expand=True)
+        self.mode = tk.StringVar(value="type")
+        tabs = tk.Frame(f, bg=UI["panel"])
+        tabs.pack(anchor="w")
+        self.tab_btns = {}
+        for mode, label in (("type", "Type"), ("draw", "Draw")):
+            b = FlatButton(tabs, label, lambda m=mode: self._tab(m), UI["panel"], font=UI["bold"], padx=14)
+            b.pack(side="left")
+            self.tab_btns[mode] = b
+        self.body = tk.Frame(f, bg=UI["panel"])
+        self.body.pack(fill="both", pady=(8, 0))
+        # Type
+        self.type_f = tk.Frame(self.body, bg=UI["panel"])
+        self.fonts = handwriting_fonts()
+        self.text = tk.StringVar()
+        self.font = tk.StringVar(value=next(iter(self.fonts), ""))
+        row = tk.Frame(self.type_f, bg=UI["panel"])
+        row.pack(fill="x")
+        e = ttk.Entry(row, textvariable=self.text, width=34, font=UI["heading"])
+        e.pack(side="left")
+        if self.fonts:
+            ttk.Combobox(row, values=list(self.fonts), textvariable=self.font, state="readonly", width=18).pack(
+                side="left", padx=(8, 0))
+        self.preview = tk.Canvas(self.type_f, width=560, height=170, bg="#ffffff", highlightthickness=1,
+                                 highlightbackground=UI["border"])
+        self.preview.pack(pady=(8, 0))
+        self.text.trace_add("write", lambda *_: self._update_preview())
+        self.font.trace_add("write", lambda *_: self._update_preview())
+        # Draw
+        self.draw_f = tk.Frame(self.body, bg=UI["panel"])
+        self.pad = tk.Canvas(self.draw_f, width=560, height=200, bg="#ffffff", highlightthickness=1,
+                             highlightbackground=UI["border"], cursor="pencil")
+        self.pad.pack()
+        self.pad.create_line(30, 160, 530, 160, fill="#c9ced6", dash=(4, 3))
+        self.pad.create_text(40, 175, text="Sign above the line with your mouse, touchpad or pen", anchor="w",
+                             fill=UI["muted"], font=UI["small"])
+        self.pad.bind("<ButtonPress-1>", self._pen_down)
+        self.pad.bind("<B1-Motion>", self._pen_move)
+        FlatButton(self.draw_f, "Clear", self._clear, UI["panel"]).pack(anchor="e", pady=(4, 0))
+        # Buttons
+        btns = tk.Frame(f, bg=UI["panel"])
+        btns.pack(fill="x", pady=(12, 0))
+        tk.Label(btns, text="Saved on this computer only, to use again later.", bg=UI["panel"],
+                 fg=UI["muted"], font=UI["small"]).pack(side="left")
+        FlatButton(btns, "  Done  ", self._done, UI["panel"], primary=True, font=UI["bold"]).pack(side="right")
+        FlatButton(btns, "Cancel", w.destroy, UI["panel"]).pack(side="right", padx=6)
+        self._tab("type" if self.fonts else "draw")
+        e.focus_set()
+        w.grab_set()
+        center_over(w, parent)
+
+    def _tab(self, mode):
+        self.mode.set(mode)
+        for m, b in self.tab_btns.items():
+            b.colors["fg"] = UI["accent"] if m == mode else UI["muted"]
+            b.config(fg=b.colors["fg"])
+        self.type_f.pack_forget()
+        self.draw_f.pack_forget()
+        (self.type_f if mode == "type" else self.draw_f).pack(fill="both")
+
+    def _image(self):
+        if self.mode.get() == "type":
+            text = self.text.get().strip()
+            return typed_signature(text, self.fonts.get(self.font.get())) if text else None
+        return drawn_signature(self.strokes, (560, 200)) if self.strokes else None
+
+    def _update_preview(self):
+        self.preview.delete("all")
+        im = self._image() if self.text.get().strip() else None
+        if im is None:
+            return
+        im = im.copy()
+        im.thumbnail((520, 150), Image.Resampling.LANCZOS)
+        bg = Image.new("RGB", im.size, "white")
+        bg.paste(im, mask=im.getchannel("A"))
+        self.preview_photo = ImageTk.PhotoImage(bg)
+        self.preview.create_image(280, 85, image=self.preview_photo)
+
+    def _pen_down(self, e):
+        self.strokes.append([(e.x, e.y)])
+        self.last = self.pad.create_oval(e.x - 1, e.y - 1, e.x + 1, e.y + 1, fill="#101828", outline="")
+
+    def _pen_move(self, e):
+        px, py = self.strokes[-1][-1]
+        if abs(e.x - px) + abs(e.y - py) < 2:
+            return
+        self.strokes[-1].append((e.x, e.y))
+        self.pad.create_line(px, py, e.x, e.y, fill="#101828", width=3, capstyle="round", smooth=True, tags="ink")
+
+    def _clear(self):
+        self.strokes = []
+        self.pad.delete("ink")
+        self.pad.delete(getattr(self, "last", None))
+
+    def _done(self):
+        im = self._image()
+        if im is None:
+            messagebox.showwarning("Nothing to save", "Type your name or draw your signature first.", parent=self.win)
+            return
+        try:
+            save_signature(self.kind, im)
+        except OSError as e:
+            log_error(f"Save signature: {e}")  # still usable now, just not remembered
+        self.win.destroy()
+        self.on_done(im)
+
+
+class CropDialog:
+    """Crop the selected pages by margins, or trim their white edges automatically."""
+    def __init__(self, app, pages):
+        self.app, self.pages = app, pages
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Crop pages")
+        w.transient(app.root)
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=14)
+        f.pack(fill="both", expand=True)
+        n = len(pages)
+        ttk.Label(f, text=f"Crop {n} selected page{'s' * (n != 1)}. Cropping hides the edges; "
+                          "nothing is deleted.").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self.m = {k: tk.StringVar(value="0") for k in ("Top", "Bottom", "Left", "Right")}
+        for i, k in enumerate(("Top", "Bottom", "Left", "Right")):
+            ttk.Label(f, text=k).grid(row=1 + i // 2, column=(i % 2) * 2, sticky="e", padx=(0, 6), pady=3)
+            ttk.Entry(f, textvariable=self.m[k], width=8).grid(row=1 + i // 2, column=(i % 2) * 2 + 1, sticky="w", pady=3)
+        ttk.Label(f, text="Margins in millimetres, as the page is shown.", foreground="gray").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(2, 8))
+        btns = ttk.Frame(f)
+        btns.grid(row=4, column=0, columnspan=4, sticky="ew")
+        ttk.Button(btns, text="Trim white margins automatically", command=self.auto).pack(side="left")
+        ttk.Button(btns, text="Remove crop", command=self.remove).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=w.destroy).pack(side="right")
+        ttk.Button(btns, text="Crop", command=self.apply).pack(side="right", padx=6)
+        w.grab_set()
+        center_over(w, app.root)
+
+    def apply(self):
+        try:
+            mm = {k: float(v.get().replace(",", ".")) for k, v in self.m.items()}
+            if any(v < 0 for v in mm.values()):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Check settings", "Margins must be numbers (0 or more).", parent=self.win)
+            return
+        pt = {k: v * 72 / 25.4 for k, v in mm.items()}
+        crops = {}
+        for p in self.pages:
+            box, R = self.app._page_box(p), self.app._total_rot(p)
+            W, H = shown_size(box, R)
+            if pt["Left"] + pt["Right"] >= W - 36 or pt["Top"] + pt["Bottom"] >= H - 36:
+                messagebox.showwarning("Too much", "Those margins would leave (almost) nothing of a page.",
+                                       parent=self.win)
+                return
+            crops[p["uid"]] = self.app._shown_margins_to_box(p, pt["Left"], pt["Bottom"], pt["Right"], pt["Top"])
+        self.win.destroy()
+        self.app._set_crops(crops, f"Cropped {len(crops)} page{'s' * (len(crops) != 1)}.")
+
+    def auto(self):
+        crops, skipped = {}, 0
+        for p in self.pages:
+            doc = self.app.docs[p["doc"]]
+            with PDFIUM_LOCK:
+                pdoc = self.app._pdfium(doc)
+                page = pdoc[p["index"]]
+                im = page.render(scale=0.6, rotation=p["rot"], may_draw_forms=True).to_pil()
+                page.close()
+            fr = auto_trim(im)
+            if not fr:
+                skipped += 1
+                continue
+            W, H = shown_size(self.app._page_box(p), self.app._total_rot(p))
+            crops[p["uid"]] = self.app._shown_margins_to_box(p, fr[0] * W, fr[3] * H, fr[2] * W, fr[1] * H)
+        self.win.destroy()
+        msg = f"Trimmed the white margins of {len(crops)} page{'s' * (len(crops) != 1)}."
+        if skipped:
+            msg += f" {skipped} blank page{'s were' if skipped != 1 else ' was'} left as {'they were' if skipped != 1 else 'it was'}."
+        self.app._set_crops(crops, msg)
+
+    def remove(self):
+        self.win.destroy()
+        self.app._set_crops({p["uid"]: None for p in self.pages}, "Crop removed.")
+
+
+class PropertiesDialog:
+    """Title, author, subject and keywords of the saved PDF."""
+    FIELDS = (("Title", "/Title"), ("Author", "/Author"), ("Subject", "/Subject"), ("Keywords", "/Keywords"))
+
+    def __init__(self, app):
+        self.app = app
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Document properties")
+        w.transient(app.root)
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=14)
+        f.pack(fill="both", expand=True)
+        current = app.docinfo or app._source_info()
+        self.v = {}
+        for i, (label, key) in enumerate(self.FIELDS):
+            ttk.Label(f, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            self.v[key] = tk.StringVar(value=current.get(key, ""))
+            ttk.Entry(f, textvariable=self.v[key], width=48).grid(row=i, column=1, sticky="w", pady=3)
+        ttk.Label(f, text="Saved into the PDF; shown by PDF readers and used by search engines.",
+                  foreground="gray").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btns = ttk.Frame(f)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=w.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", command=self.ok).pack(side="right", padx=6)
+        w.grab_set()
+        center_over(w, app.root)
+
+    def ok(self):
+        self.app.docinfo = {k: v.get().strip() for k, v in self.v.items()}
+        self.app.dirty = True
+        self.app._update_title()
+        self.app._status("Document properties will be saved with the PDF.")
+        self.win.destroy()
+
+
+class FillSignWindow:
+    """Fill in forms and sign: type into the PDF's own fields, or click anywhere to
+    add text, a tick, a cross, the date, your signature or your initials."""
+    TOOLS = (("text", "Ab", "Add text"), ("check", "✓", "Add a tick"), ("cross", "✗", "Add a cross"),
+             ("date", "📅", "Add today's date"))
+
+    def __init__(self, app, start):
+        self.app = app
+        self.k = start  # index into app.pages
+        self.tool = None
+        self.sel = None  # id of the selected placed item
+        self.editing = None
+        self.widgets = []
+        self.drag = None
+        self.before = app._fill_state()
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Fill & Sign — PDF Toolkit")
+        w.configure(bg=UI["canvas"])
+        sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+        w.geometry(f"{min(1180, sw - 80)}x{min(900, sh - 100)}")
+        w.minsize(760, 560)
+        w.transient(app.root)
+        w.protocol("WM_DELETE_WINDOW", self.done)
+
+        bar = tk.Frame(w, bg=UI["appbar"], height=48)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="✍  Fill & Sign", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left", padx=14)
+        FlatButton(bar, "  Done  ", self.done, UI["appbar"], primary=True, font=UI["bold"], pady=6).pack(
+            side="right", padx=14, pady=8)
+        self.page_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["font"])
+        self.page_lbl.pack(side="right", padx=4)
+        FlatButton(bar, "▶", lambda: self.go(1), UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip="Next page").pack(side="right")
+        FlatButton(bar, "◀", lambda: self.go(-1), UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip="Previous page").pack(side="right")
+
+        tools = tk.Frame(w, bg=UI["toolbar"], height=46, highlightthickness=1, highlightbackground=UI["border"])
+        tools.pack(fill="x")
+        tools.pack_propagate(False)
+        self.tool_btns = {}
+        for key, icon, tip in self.TOOLS:
+            b = FlatButton(tools, icon, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["icon"], padx=11, tip=tip)
+            b.pack(side="left", padx=(8 if key == "text" else 1, 1), pady=4)
+            self.tool_btns[key] = b
+        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+        self.sign_btn = FlatButton(tools, "✍  Sign ▾", self.sign_menu, UI["toolbar"], font=UI["bold"],
+                                   tip="Add your signature or initials")
+        self.sign_btn.pack(side="left")
+        tk.Frame(tools, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+        for icon, fn, tip in (("A−", lambda: self.resize(-1), "Smaller"), ("A+", lambda: self.resize(1), "Bigger"),
+                              ("🗑", self.delete_mark, "Delete the selected item (Del)")):
+            FlatButton(tools, icon, fn, UI["toolbar"], font=UI["bold"] if icon != "🗑" else UI["icon"], padx=9,
+                       tip=tip).pack(side="left", padx=1)
+        self.hint = tk.Label(tools, text="", bg=UI["toolbar"], fg=UI["muted"], font=UI["small"])
+        self.hint.pack(side="right", padx=12)
+
+        self.canvas = tk.Canvas(w, bg=UI["canvas"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        c = self.canvas
+        c.bind("<Configure>", lambda e: self.show())
+        c.bind("<ButtonPress-1>", self.on_press)
+        c.bind("<B1-Motion>", self.on_drag)
+        c.bind("<ButtonRelease-1>", self.on_release)
+        c.bind("<Double-Button-1>", self.on_double)
+        w.bind("<Delete>", lambda e: self.delete_mark() if not isinstance(e.widget, (tk.Entry, ttk.Entry, ttk.Combobox)) else None)
+        w.bind("<Escape>", lambda e: (self.set_tool(None), self.select(None)))
+        w.bind("<Prior>", lambda e: self.go(-1))
+        w.bind("<Next>", lambda e: self.go(1))
+        self.set_tool(None)
+        center_over(w, app.root)
+        w.after(50, self.show)
+
+    # ---- page & coordinates ---------------------------------------------- #
+    def page(self):
+        return self.app.pages[self.k]
+
+    def go(self, step):
+        self.commit_edit()
+        k = self.k + step
+        if 0 <= k < len(self.app.pages):
+            self.k = k
+            self.select(None)
+            self.show()
+
+    def show(self):
+        """Draw the current page, its form fields and its placed items."""
+        self.commit_edit()
+        c = self.canvas
+        c.delete("all")
+        for wdg in self.widgets:
+            wdg.destroy()
+        self.widgets = []
+        p = self.page()
+        doc = self.app.docs[p["doc"]]
+        box, R = self.app._page_box(p), self.app._total_rot(p)
+        crop = p.get("crop") or box
+        # The visible (cropped) part, in shown coordinates.
+        pts = [to_shown(box, R, x, y) for x, y in ((crop[0], crop[1]), (crop[2], crop[3]))]
+        self.cx0, self.cy0 = min(q[0] for q in pts), min(q[1] for q in pts)
+        cw, ch = abs(pts[1][0] - pts[0][0]), abs(pts[1][1] - pts[0][1])
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 50 or H < 50:
+            return
+        self.s = min((W - 60) / cw, (H - 40) / ch)
+        self.ox, self.oy = (W - cw * self.s) / 2, (H - ch * self.s) / 2
+        self.vh = ch  # visible height, in points
+        Wf, Hf = shown_size(box, R)
+        with PDFIUM_LOCK:
+            pdoc = self.app._pdfium(doc)
+            pg = pdoc[p["index"]]
+            # PDFium crops in shown coordinates too: left, bottom, right, top.
+            im = pg.render(scale=self.s, rotation=p["rot"], may_draw_forms=False,
+                           crop=(self.cx0, self.cy0, Wf - self.cx0 - cw, Hf - self.cy0 - ch)).to_pil()
+            pg.close()
+        self.photo = ImageTk.PhotoImage(im)
+        c.create_rectangle(self.ox + 3, self.oy + 3, self.ox + im.width + 3, self.oy + im.height + 3,
+                           fill="#b9bdc4", outline="")
+        c.create_image(self.ox, self.oy, image=self.photo, anchor="nw")
+        self.page_lbl.config(text=f"Page {self.k + 1} of {len(self.app.pages)}")
+        self.draw_fields(p, doc, box, R)
+        for m in self.app.marks.get(p["uid"], []):
+            self.draw_mark(m)
+        if self.sel:
+            self.select(self.sel)
+
+    def to_canvas(self, x, y):
+        p = self.page()
+        X, Y = to_shown(self.app._page_box(p), self.app._total_rot(p), x, y)
+        return self.ox + (X - self.cx0) * self.s, self.oy + (self.vh - (Y - self.cy0)) * self.s
+
+    def from_canvas(self, cx, cy):
+        p = self.page()
+        X = (cx - self.ox) / self.s + self.cx0
+        Y = self.vh - (cy - self.oy) / self.s + self.cy0
+        return to_page(self.app._page_box(p), self.app._total_rot(p), X, Y)
+
+    def canvas_rect(self, rect):
+        a = self.to_canvas(rect[0], rect[1])
+        b = self.to_canvas(rect[2], rect[3])
+        return min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])
+
+    # ---- form fields --------------------------------------------------------- #
+    def draw_fields(self, p, doc, box, R):
+        fields = [f for f in self.app._fields(p["doc"]) if f["page"] == p["index"]]
+        values = self.app.fill.setdefault(p["doc"], {})
+        field_bg = "#dde9fb"
+        for f in fields:
+            x0, y0, x1, y1 = self.canvas_rect(f["rect"])
+            w, h = max(8, x1 - x0), max(8, y1 - y0)
+            name = f["name"]
+            current = values.get(name, f["value"] if f["kind"] in ("text", "choice") else
+                                 (f["value"] == f["on"] if f["kind"] == "check" else f["value"]))
+            if f["readonly"]:
+                continue
+            if f["kind"] == "text":
+                var = tk.StringVar(value=current)
+                size = -max(9, min(int(h * 0.62), 22)) if not f["multiline"] else -12
+                if f["multiline"]:
+                    wdg = tk.Text(self.canvas, bg=field_bg, relief="flat", font=("Helvetica", size), wrap="word",
+                                  highlightthickness=1, highlightbackground="#9cb8e6", highlightcolor=UI["accent"])
+                    wdg.insert("1.0", current)
+                    wdg.bind("<KeyRelease>", lambda e, n=name, t=wdg: self.set_value(n, t.get("1.0", "end-1c")))
+                else:
+                    wdg = tk.Entry(self.canvas, textvariable=var, bg=field_bg, relief="flat", font=("Helvetica", size),
+                                   highlightthickness=1, highlightbackground="#9cb8e6", highlightcolor=UI["accent"])
+                    var.trace_add("write", lambda *_, n=name, v=var: self.set_value(n, v.get()))
+                    wdg.var = var
+                self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=w, height=h)
+            elif f["kind"] == "choice":
+                var = tk.StringVar(value=current)
+                wdg = ttk.Combobox(self.canvas, values=f["options"], textvariable=var)
+                var.trace_add("write", lambda *_, n=name, v=var: self.set_value(n, v.get()))
+                wdg.var = var
+                self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=max(w, 60), height=h)
+            else:
+                on = (current is True) if f["kind"] == "check" else (current == f["on"])
+                wdg = tk.Label(self.canvas, text="✔" if on else "", bg=field_bg, fg="#101828", cursor="hand2",
+                               font=(UI["family"], -max(8, int(min(w, h) * 0.75))), relief="flat", bd=0,
+                               highlightthickness=1, highlightbackground="#9cb8e6")
+                wdg.bind("<Button-1>", lambda e, fld=f: self.toggle(fld))
+                self.canvas.create_window(x0, y0, window=wdg, anchor="nw", width=w, height=h)
+            self.widgets.append(wdg)
+        if fields:
+            self.hint.config(text="This page has form fields: click one to fill it in.")
+        elif not self.tool:
+            self.hint.config(text="Choose a tool, then click on the page to place it.")
+
+    def set_value(self, name, value):
+        self.app.fill.setdefault(self.page()["doc"], {})[name] = value
+
+    def toggle(self, f):
+        values = self.app.fill.setdefault(self.page()["doc"], {})
+        if f["kind"] == "check":
+            current = values.get(f["name"], f["value"] == f["on"])
+            values[f["name"]] = not current
+        else:
+            current = values.get(f["name"], f["value"])
+            values[f["name"]] = "" if current == f["on"] else f["on"]
+        self.show()
+
+    # ---- placed items -------------------------------------------------------- #
+    def draw_mark(self, m):
+        c, s = self.canvas, self.s
+        p = self.page()
+        R = self.app._total_rot(p)
+        turn = (R - m["rot"]) % 360  # the page was turned after this was placed
+        cx, cy = self.to_canvas(m["x"], m["y"])
+        tag = ("mark", f"m{m['id']}")
+        if m["kind"] in ("text", "date"):
+            c.create_text(cx, cy, text=m["text"], font=("Helvetica", -max(4, int(m["size"] * s))), fill="#000000",
+                          angle=-turn, tags=tag)
+        elif m["kind"] in MARK_GLYPHS:
+            c.create_text(cx, cy, text="✔" if m["kind"] == "check" else "✘", fill="#000000",
+                          font=(UI["family"], -max(4, int(m["size"] * s))), angle=-turn, tags=tag)
+        else:
+            w, h = mark_size(m)
+            im = m["image"].resize((max(1, int(w * s)), max(1, int(h * s))), Image.Resampling.LANCZOS)
+            if turn:
+                im = im.rotate(-turn, expand=True)
+            photo = ImageTk.PhotoImage(im)
+            m.setdefault("_photos", {})[self.k] = photo  # keep a reference
+            c.create_image(cx, cy, image=photo, tags=tag)
+
+    def mark(self, mid):
+        for m in self.app.marks.get(self.page()["uid"], []):
+            if m["id"] == mid:
+                return m
+        return None
+
+    def select(self, mid):
+        self.canvas.delete("selbox")
+        self.sel = mid
+        if mid is None or self.mark(mid) is None:
+            self.sel = None
+            return
+        b = self.canvas.bbox(f"m{mid}")
+        if b:
+            self.canvas.create_rectangle(b[0] - 4, b[1] - 3, b[2] + 4, b[3] + 3, outline=UI["accent"], dash=(4, 2),
+                                         width=2, tags="selbox")
+
+    def set_tool(self, tool):
+        self.tool = tool
+        for k, b in self.tool_btns.items():
+            b.colors["bg"] = UI["sel_bg"] if k == tool else UI["toolbar"]
+            b.config(bg=b.colors["bg"])
+        self.canvas.config(cursor="crosshair" if tool else "")
+        self.hint.config(text={None: "Choose a tool, then click on the page to place it. Drag items to move them.",
+                               "text": "Click where the text should start, then type.",
+                               "check": "Click to place a tick.", "cross": "Click to place a cross.",
+                               "date": "Click to place today's date.",
+                               "signature": "Click where your signature goes.",
+                               "initials": "Click where your initials go."}[tool])
+
+    def sign_menu(self):
+        menu = tk.Menu(self.win, tearoff=0)
+        sig, ini = load_signature("signature"), load_signature("initials")
+        menu.add_command(label="Add signature" if sig else "Create signature…", command=lambda: self.use_sig("signature"))
+        menu.add_command(label="Add initials" if ini else "Create initials…", command=lambda: self.use_sig("initials"))
+        menu.add_separator()
+        if sig:
+            menu.add_command(label="Change signature…", command=lambda: self.new_sig("signature"))
+        if ini:
+            menu.add_command(label="Change initials…", command=lambda: self.new_sig("initials"))
+        if sig or ini:
+            menu.add_command(label="Forget my saved signature and initials", command=self.forget)
+        b = self.sign_btn
+        menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def use_sig(self, kind):
+        im = load_signature(kind)
+        if im is None:
+            self.new_sig(kind)
+        else:
+            self.pending_image = im
+            self.set_tool(kind)
+
+    def new_sig(self, kind):
+        def done(im):
+            self.pending_image = im
+            self.set_tool(kind)
+        SignatureDialog(self.win, kind, done)
+
+    def forget(self):
+        if messagebox.askyesno("Forget signature?", "Delete your saved signature and initials from this computer? "
+                               "Ones already placed in documents stay.", parent=self.win):
+            forget_signatures()
+            self.app._status("Your saved signature and initials were deleted from this computer.")
+
+    def add_mark(self, kind, cx, cy, text=None):
+        p = self.page()
+        x, y = self.from_canvas(cx, cy)
+        m = dict(id=self.app._new_mark_id(), kind=kind, x=x, y=y, rot=self.app._total_rot(p), size=12)
+        if kind == "date":
+            m["text"] = time.strftime("%d %b %Y").lstrip("0")
+        elif kind == "text":
+            m["text"] = text or ""
+        elif kind in ("signature", "initials"):
+            m["image"] = self.pending_image
+            m["w"] = 150 if kind == "signature" else 55
+            m["size"] = None
+        elif kind in MARK_GLYPHS:
+            m["size"] = 14
+        self.app.marks.setdefault(p["uid"], []).append(m)
+        if kind == "text":
+            # Text starts at the click: move its centre half its width to the right.
+            self.draw_mark(m)
+            self.edit_text(m, new=True)
+        else:
+            self.draw_mark(m)
+            self.select(m["id"])
+        return m
+
+    def edit_text(self, m, new=False):
+        """Type into a placed text item, in place."""
+        self.commit_edit()
+        cx, cy = self.to_canvas(m["x"], m["y"])
+        self.canvas.delete(f"m{m['id']}")
+        var = tk.StringVar(value=m["text"])
+        size = max(4, int(m["size"] * self.s))
+        e = tk.Entry(self.canvas, textvariable=var, font=("Helvetica", -size), relief="flat", bg="#fffbe6",
+                     highlightthickness=1, highlightbackground=UI["accent"])
+        width = max(160, int(text_width(m["text"] or "W" * 12, m["size"]) * self.s) + 30)
+        x0 = cx if new else cx - (text_width(m["text"], m["size"]) * self.s) / 2
+        win = self.canvas.create_window(x0, cy, window=e, anchor="w", width=width, height=size + 10)
+        self.editing = (m, var, e, win, new, x0, cy)
+        e.focus_set()
+        e.icursor("end")
+        e.bind("<Return>", lambda ev: self.commit_edit())
+        e.bind("<Escape>", lambda ev: self.commit_edit())
+        e.bind("<FocusOut>", lambda ev: self.win.after(1, self.commit_edit))
+
+    def commit_edit(self):
+        if not self.editing:
+            return
+        m, var, e, win, new, x0, cy = self.editing
+        self.editing = None
+        text = var.get().strip()
+        try:
+            self.canvas.delete(win)
+            e.destroy()
+        except tk.TclError:
+            pass
+        uid = self.page()["uid"]
+        if not text:
+            self.app.marks[uid] = [x for x in self.app.marks.get(uid, []) if x["id"] != m["id"]]
+            return
+        m["text"] = text
+        if new:  # placed at the click as its left edge: centre it from there
+            w = text_width(text, m["size"]) * self.s
+            m["x"], m["y"] = self.from_canvas(x0 + w / 2 + 1, cy)
+        self.draw_mark(m)
+        self.select(m["id"])
+
+    def resize(self, step):
+        m = self.mark(self.sel) if self.sel else None
+        if m is None:
+            self.hint.config(text="Select an item on the page first (click it).")
+            return
+        if m["kind"] in ("signature", "initials"):
+            m["w"] = max(20, min(500, m["w"] * (1.15 if step > 0 else 1 / 1.15)))
+        else:
+            m["size"] = max(6, min(72, m["size"] + 2 * step))
+        self.show()
+
+    def delete_mark(self):
+        if self.sel is None:
+            return
+        uid = self.page()["uid"]
+        self.app.marks[uid] = [m for m in self.app.marks.get(uid, []) if m["id"] != self.sel]
+        self.sel = None
+        self.show()
+
+    # ---- mouse ---------------------------------------------------------------- #
+    def _hit(self, x, y):
+        for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
+            for t in self.canvas.gettags(item):
+                if t.startswith("m") and t != "mark":
+                    return int(t[1:])
+        return None
+
+    def on_press(self, e):
+        self.commit_edit()
+        self.canvas.focus_set()
+        hit = self._hit(e.x, e.y)
+        if hit is not None and not self.tool:
+            self.select(hit)
+            m = self.mark(hit)
+            self.drag = dict(id=hit, x=e.x, y=e.y, start=self.to_canvas(m["x"], m["y"]), moved=False)
+            return
+        if self.tool:
+            # Only on the page itself.
+            if not (self.ox <= e.x <= self.ox + self.photo.width() and self.oy <= e.y <= self.oy + self.photo.height()):
+                return
+            kind = self.tool
+            self.set_tool(None)
+            self.add_mark(kind, e.x, e.y)
+            return
+        self.select(None)
+
+    def on_drag(self, e):
+        d = self.drag
+        if not d:
+            return
+        if not d["moved"] and abs(e.x - d["x"]) + abs(e.y - d["y"]) < 3:
+            return
+        d["moved"] = True
+        dx, dy = e.x - d["x"], e.y - d["y"]
+        self.canvas.move(f"m{d['id']}", dx - d.get("dx", 0), dy - d.get("dy", 0))
+        self.canvas.move("selbox", dx - d.get("dx", 0), dy - d.get("dy", 0))
+        d["dx"], d["dy"] = dx, dy
+
+    def on_release(self, e):
+        d, self.drag = self.drag, None
+        if d and d["moved"]:
+            m = self.mark(d["id"])
+            sx, sy = d["start"]
+            m["x"], m["y"] = self.from_canvas(sx + d["dx"], sy + d["dy"])
+
+    def on_double(self, e):
+        hit = self._hit(e.x, e.y)
+        m = self.mark(hit) if hit is not None else None
+        if m and m["kind"] == "text":
+            self.edit_text(m)
+
+    def done(self):
+        self.commit_edit()
+        # Drop empty values and empty texts, then record one undo step for the whole session.
+        for uid in list(self.app.marks):
+            self.app.marks[uid] = [m for m in self.app.marks[uid] if m["kind"] not in ("text",) or m.get("text")]
+            if not self.app.marks[uid]:
+                del self.app.marks[uid]
+        self.app._fill_done(self.before)
+        self.win.destroy()
+
+
 class PageViewer:
     """One page, large, to read it before deciding where it goes."""
     def __init__(self, app, page):
@@ -1727,14 +3102,12 @@ class PageViewer:
         w.transient(app.root)
         side = max(400, min(app.root.winfo_screenheight() - 160, 1000))
         with PDFIUM_LOCK:
-            if doc.render is None:
-                doc.render = pdfium.PdfDocument(doc.data, password=doc.password or None)
-            pg = doc.render[page["index"]]
+            pg = app._pdfium(doc)[page["index"]]
             pw, ph = pg.get_size()
             if page["rot"] in (90, 270):
                 pw, ph = ph, pw
             scale = side / max(pw, ph)
-            im = pg.render(scale=scale, may_draw_forms=True, rotation=page["rot"]).to_pil()
+            im = pg.render(scale=scale, may_draw_forms=True, rotation=page["rot"], crop=app._render_crop(page)).to_pil()
             pg.close()
         self.photo = ImageTk.PhotoImage(im)
         tk.Label(w, image=self.photo, bg="#6b7280").pack(padx=0, pady=0)
@@ -1767,6 +3140,19 @@ def log_error(text):
             f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{text}\n")
     except OSError:
         pass
+
+
+def open_file(path):
+    """Open a file in its usual app (the PDF reader, for a PDF)."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        log_error(f"Open {path}: {e}")
 
 
 def reveal_file(path):
@@ -1804,6 +3190,19 @@ def self_test():
         text = doc[0].get_textpage().get_text_range()
         if len(doc) != 2 or "Page 1 of 2" not in text:
             return 2
+        # Fill & Sign: placed text and a typed signature, flattened into the page.
+        signed = pikepdf.open(io.BytesIO(image_to_pdf(img, "A4")))
+        box, rot = page_boxes(signed)[0]
+        sig = typed_signature("Test", next(iter(handwriting_fonts().values()), None))
+        marks = [dict(id=1, kind="text", text="Filled in", size=12, x=200, y=700, rot=rot),
+                 dict(id=2, kind="signature", image=sig, w=120, size=None, x=300, y=600, rot=rot)]
+        signed.pages[0].obj.Annots = pikepdf.Array([mark_annotation(signed, m, box) for m in marks])
+        signed.flatten_annotations("all")
+        buf = io.BytesIO()
+        signed.save(buf)
+        doc = pdfium.PdfDocument(buf.getvalue())
+        if "Filled in" not in doc[0].get_textpage().get_text_range():
+            return 4
         root = tk.Tk()
         root.withdraw()
         from tkinterdnd2 import TkinterDnD

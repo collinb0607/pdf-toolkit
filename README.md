@@ -2,11 +2,12 @@
 
 **Free, offline alternative to online PDF tools. No "2 free tasks a day", no uploads, no account.**
 
-![PDF Toolkit: open three PDFs, move, rotate and delete pages, add page numbers, compress and save](docs/demo.gif)
+![PDF Toolkit: organize pages, then fill in a form and sign it](docs/demo.gif)
 
-Merge, reorder, rotate, delete and extract pages, split, compress, turn images into a PDF or pages
-into images, add page numbers or a watermark, and add or remove a password, all in one window that
-shows every page as a thumbnail. Your documents never leave your computer. Works on Windows and macOS.
+Merge, reorder, rotate, crop, delete and extract pages, split, compress, **fill in forms and sign**,
+turn images into a PDF or pages into images, add page numbers, headers and footers, Bates numbers or a
+watermark, and add or remove a password, all in one window that shows every page as a thumbnail.
+Your documents never leave your computer. Works on Windows and macOS.
 
 ## Download
 Get the latest version from the [Releases page](https://github.com/collinb0607/pdf-toolkit/releases/latest).
@@ -28,9 +29,31 @@ Open files, arrange the pages, save. The **Tools** panel on the left sets what h
 - **Reorder**: drag pages. Select several with Ctrl+click or Shift+click and drag them together.
 - **Rotate, duplicate, delete** from the toolbar, the right-click menu, or the keyboard (Delete,
   Ctrl+D). Ctrl+Z / Ctrl+Y undo and redo, as many steps back as you like.
+- **Insert a blank page** after the selected one (the same size as it).
+- **Crop**: set margins in millimetres, or **trim white margins automatically**. Nothing is deleted:
+  the edges are just hidden, and **Remove crop** brings them back.
 - **Page size** slider makes the thumbnails bigger or smaller; double-click a page to see it large.
 - Big documents are fine: 800 pages open in a fraction of a second, and thumbnails are drawn as you
   scroll.
+
+**Fill & Sign**
+
+Select a page and click **✍ Fill & Sign**. The page opens large:
+- **Form fields** (in fillable PDFs) are highlighted: type into them, tick boxes, pick options.
+- **Type anywhere**, on any PDF, fillable or not: pick **Ab** and click where the text goes. **✓**, **✗**
+  and **📅** (today's date) work the same way. Drag anything to move it; **A−**/**A+** resize it; Delete
+  removes it; double-click text to change it.
+- **Sign ▾** adds your signature or initials. Create them once by **typing** your name (shown in a
+  handwriting font from your computer) or **drawing** with the mouse, touchpad or pen. They're
+  remembered on this computer only (in a `.pdf-toolkit` folder in your user folder) until you choose
+  **Forget my saved signature and initials**.
+- When you save, the app asks whether to **flatten**: make everything part of the page, so it can't
+  be changed or moved (best for a signed contract), or keep it editable (form fields stay fillable,
+  and placed text and signatures stay movable in PDF editors). Tick **Flatten when saving** in the
+  Tools panel to always flatten without asking.
+
+This is a picture of your signature, like Acrobat's Fill & Sign. It isn't a certificate-based
+digital signature, which proves who signed and that nothing changed since.
 
 **Save**
 - **Save as PDF**: every page in the workspace, as one PDF. Saving over one of the files you opened
@@ -40,6 +63,8 @@ Open files, arrange the pages, save. The **Tools** panel on the left sets what h
   "4, 9"), or one file per original file.
 - **Export pages as images**: PNG or JPG, at the resolution you choose (150 DPI for screens, 300 for
   printing).
+- **Print**: builds the finished PDF and opens it in your PDF reader; print from there.
+- **Document properties**: set the title, author, subject and keywords saved in the PDF.
 
 **Tools panel**, applied to whatever you save:
 
@@ -48,11 +73,15 @@ Open files, arrange the pages, save. The **Tools** panel on the left sets what h
 | Compress | Re-compresses the photos and scans inside the PDF. **Light** keeps them full size (JPEG quality 85), **Balanced** shrinks them to 2000 pixels (quality 70), **Strong** to 1200 pixels (quality 50). Text and drawings are never touched, and an image is only replaced if the new one is smaller. A 9.4 MB scanned PDF became 4.5 MB, 1.1 MB or 0.3 MB. |
 | Page numbers | "1", "Page 1", "Page 1 of 9" or "1 / 9", bottom centre, bottom right or top right. Placed upright on every page, even rotated ones. |
 | Watermark | Your text, large, faint and diagonal across every page (e.g. DRAFT, CONFIDENTIAL). |
+| Header & footer | Your own text at the top and bottom of every page, left, centred or right. `{page}`, `{pages}`, `{date}`, `{file}` and `{bates}` are filled in, e.g. `{file} — page {page} of {pages}`. |
+| Bates numbers | `{bates}` becomes a prefix and running number, e.g. ACME-000041, ACME-000042… (six digits). When splitting, the numbers continue from file to file. |
+| Forms & signatures | **Flatten when saving**: always make filled-in fields, signatures and comments part of the page. |
 | Protect | A password needed to open the saved file (AES-256). Leave it off to save without one: that's how you **remove** a password from a PDF you opened. |
 | Images to PDF | Each added image becomes a page: the image's own size, or centred on A4 or Letter paper. JPEG photos go in unchanged (no quality loss); other images are stored losslessly, transparency included. |
 
-Fillable form fields keep working after you rearrange pages. Bookmarks (the outline in a PDF
-reader's sidebar) and links between pages aren't carried over.
+Fillable form fields keep working after you rearrange pages. **Bookmarks** (the outline in a PDF
+reader's sidebar) are kept, pointing at the right pages; ones whose page you deleted are dropped.
+When you combine files, each file gets a bookmark with its name, holding its own bookmarks.
 
 ## Run from source (Python)
 ### Setup (one time)
@@ -71,8 +100,10 @@ double-click `pdf_toolkit.py`. If you have more than one Python installed, doubl
 different one from `python` in a terminal, so it may ask to install the components once more.
 
 ## Troubleshooting
-- **Page numbers or watermark show "?" for some characters:** they use the standard Helvetica font
-  built into every PDF reader, which covers Western European letters only.
+- **Page numbers, headers, typed text or watermark show "?" for some characters:** they use the
+  standard Helvetica font built into every PDF reader, which covers Western European letters only.
+- **A form's fields don't appear in Fill & Sign:** some forms (XFA forms made with Adobe LiveCycle)
+  aren't standard PDF fields. Use **Ab** to type on the page instead.
 - **Compress made little difference:** the PDF is mostly text, or its images are already small or in
   formats that are left alone (black-and-white scans, CMYK print images).
 - **"The PDF looks damaged":** try opening and re-saving it in another PDF reader first.
