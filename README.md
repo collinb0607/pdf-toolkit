@@ -4,8 +4,8 @@
 
 ![PDF Toolkit: open a contract, search it, highlight and comment, then sign it and save](docs/demo.gif)
 
-Merge, reorder, rotate, crop, delete and extract pages, split, compress, **read and search**,
-**comment and mark up**, **fill in forms and sign** (including **certificate signatures**), **create
+Merge, reorder, rotate, crop, delete and extract pages, split, compress, **edit the text and
+pictures already in a PDF**, **read and search**, **comment and mark up**, **fill in forms and sign** (including **certificate signatures**), **create
 fillable forms**, **compare two PDFs**, turn images into a PDF or pages into images, add page numbers,
 headers and footers, Bates numbers or a watermark, and add or remove a password. Your documents never
 leave your computer. Works on Windows and macOS.
@@ -23,7 +23,7 @@ On an Intel Mac, or any other system, run it from source with Python (below).
 
 ## How it works
 Open files, then use the tabs at the top, as in big-name PDF editors: **Organize** (the page grid),
-**View**, **Comment**, **Fill & Sign**, **Prepare form** and **Compare**. Everything you do is added to
+**View**, **Edit PDF**, **Comment**, **Fill & Sign**, **Prepare form** and **Compare**. Everything you do is added to
 the PDF when you save; the **Tools** panel on the left sets what else happens when you save.
 
 **Organize pages**
@@ -42,6 +42,26 @@ the PDF when you save; the **Tools** panel on the left sets what else happens wh
 **View**: read pages large, zoom (or **Fit**), scroll from page to page. **Search** (Ctrl+F) finds
 text in every page and highlights each match. Drag across text to select it; Ctrl+C copies it.
 Double-clicking a page in the grid opens it here.
+
+**Edit PDF**: change what's actually on the page, not a layer on top of it.
+
+![Edit PDF: click a paragraph and type over it; the text re-wraps in its own font](docs/edit-pdf.png)
+
+- **Click any text** to edit it in place, then click outside (or Ctrl+Enter) to apply; Esc cancels.
+  The paragraph re-wraps to its own width, and a heading or single line can grow toward the margin.
+  **A−**/**A+** change the size; deleting all the words removes the text.
+- The new words use the **PDF's own font** when it already has every letter needed. If not, the
+  **same font from your computer** is used (only the letters needed are embedded, and only if the
+  font's licence allows it), and otherwise the closest standard font (Helvetica, Times or Courier).
+- The old text is really gone (search and copy find the new words), and everything else on the page
+  stays exactly where it was. If the new text is longer than the old, the editor says so: it runs
+  below the original space rather than pushing the rest of the page down.
+- **Pictures**: click one to select it, drag to move it, drag its corner to resize it (keeping its
+  shape), **Replace image** to swap it, Delete to remove it. **＋ Image** and **＋ Text** add new ones.
+- Every change is one undo step (Ctrl+Z or ↶), and the original file is never changed until you save.
+- Limits: a paragraph that mixes fonts (like a bold word in a sentence) comes out in one font; text
+  on turned pages, rotated text and text inside embedded graphics can't be edited yet; scans are
+  pictures, so their "text" can't be edited (run OCR software first).
 
 **Comment**: **highlight**, **underline** or **strike through** text (drag across it), add **sticky
 notes**, **text boxes**, **rectangles**, **ellipses**, **arrows** and **freehand drawing**, in five
@@ -117,8 +137,8 @@ When you combine files, each file gets a bookmark with its name, holding its own
 1. Install **Python 3.8+** from https://python.org. On Windows, tick **"Add Python to PATH"** during install.
 2. Run the app (see below). The first time, it asks to install **pikepdf** (edits PDFs, using qpdf),
    **pypdfium2** (draws pages, using Google's PDFium), **Pillow** and **pillow-heif** (images, including
-   HEIC), **pyHanko** (certificate signatures) and **tkinterdnd2** (drag and drop). Click **Yes**; it's
-   about a 40 MB download.
+   HEIC), **pyHanko** (certificate signatures), **fontTools** (uses your computer's fonts when editing
+   text) and **tkinterdnd2** (drag and drop). Click **Yes**; it's about a 45 MB download.
 
 ### Run
 ```
@@ -132,6 +152,9 @@ different one from `python` in a terminal, so it may ask to install the componen
 ## Troubleshooting
 - **Page numbers, headers, typed text or watermark show "?" for some characters:** they use the
   standard Helvetica font built into every PDF reader, which covers Western European letters only.
+- **Edited text came out in a different font:** the PDF only contained the letters it originally
+  used, and the font isn't installed on this computer (or its licence forbids embedding), so the
+  closest standard font was used. Installing the font and editing again uses it.
 - **"Signer's identity is unknown" in Acrobat:** the signature was made with a self-signed
   certificate. The document is still protected against changes; to prove identity, use a certificate
   from an authority.
@@ -148,8 +171,9 @@ different one from `python` in a terminal, so it may ask to install the componen
 
 ## Credits
 Built on [pikepdf](https://github.com/pikepdf/pikepdf) / [qpdf](https://github.com/qpdf/qpdf),
-[pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / [PDFium](https://pdfium.googlesource.com/pdfium/)
-and [pyHanko](https://github.com/MatthiasValvekens/pyHanko) (certificate signatures), all under
+[pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / [PDFium](https://pdfium.googlesource.com/pdfium/),
+[pyHanko](https://github.com/MatthiasValvekens/pyHanko) (certificate signatures) and
+[fontTools](https://github.com/fonttools/fonttools) (font subsetting), all under
 permissive licences (MPL-2.0, Apache-2.0, BSD, MIT).
 
 ## Part of the Offline Toolkit

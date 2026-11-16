@@ -2,11 +2,11 @@
 """
 PDF Toolkit - a cross-platform (Windows / macOS / Linux) desktop app for the
 PDF jobs websites charge for: merge, reorder, rotate, delete, crop and extract
-pages, split, compress, convert images to PDF and pages to images, view and
-search, comment and mark up, fill in forms and sign (including certificate
-signatures), create fillable forms, compare two PDFs, add page numbers,
-headers and footers, Bates numbers or a watermark, and add or remove a
-password. Everything stays on your computer.
+pages, split, compress, convert images to PDF and pages to images, edit the
+pages' own text and images, view and search, comment and mark up, fill in
+forms and sign (including certificate signatures), create fillable forms,
+compare two PDFs, add page numbers, headers and footers, Bates numbers or a
+watermark, and add or remove a password. Everything stays on your computer.
 
 Pages are shown as thumbnails in one workspace: open PDFs and images, arrange
 the pages, then save. Compression, page numbers, watermark and password are
@@ -18,9 +18,10 @@ Requirements:
     pypdfium2   -> draws the page thumbnails and exports pages as images (PDFium)
     Pillow, pillow-heif -> images (pillow-heif opens iPhone HEIC photos)
     pyhanko     -> certificate (digital) signatures
+    fonttools   -> uses this computer's fonts when editing a PDF's text
     tkinterdnd2 -> drag and drop from other apps (optional: the app works without it)
     The app offers to install them on first run. Manual install, using the Python that runs the app:
-        python -m pip install pikepdf pypdfium2 pillow pillow-heif pyhanko tkinterdnd2
+        python -m pip install pikepdf pypdfium2 pillow pillow-heif pyhanko fonttools tkinterdnd2
 
 Run:
     python pdf_toolkit.py
@@ -35,6 +36,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import zlib
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -42,7 +44,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 # install them) when they're missing.
 pikepdf = pdfium = Image = ImageOps = ImageTk = None
 
-PACKAGES = ["pikepdf", "pypdfium2", "pillow", "pillow-heif", "pyhanko", "tkinterdnd2"]
+PACKAGES = ["pikepdf", "pypdfium2", "pillow", "pillow-heif", "pyhanko", "fonttools", "tkinterdnd2"]
 PDF_EXTS = {".pdf"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff", ".gif"}
 FILE_TYPES = [
@@ -122,6 +124,10 @@ def load_libraries():
         import pyhanko.sign  # noqa: F401
     except ImportError:
         missing.append("pyhanko")
+    try:
+        import fontTools.subset  # noqa: F401
+    except ImportError:
+        missing.append("fonttools")
     try:
         import tkinterdnd2  # noqa: F401
     except ImportError:
@@ -1177,6 +1183,887 @@ def word_changes(old, new):
     return out
 
 
+# ---- editing a page's own text and images ---------------------------------------- #
+# A PDF page is a list of drawing operators. To edit text in place, the page's
+# operators are read the way a PDF renderer does (graphics state, text state,
+# fonts) to learn where every glyph is and what character it is. Editing a
+# paragraph then (1) replaces the operators that drew it with ones that draw
+# nothing but move the pen the same distance, so everything after stays where it
+# was, and (2) draws the new text, re-wrapped to the paragraph's width: in the
+# PDF's own embedded font when it has every character needed, otherwise in the
+# same font from this computer (only the letters used are embedded), otherwise
+# in the closest standard font.
+STD_WIDTHS = {
+    "Helvetica": HELVETICA,
+    "Helvetica-Bold": [278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584],
+    "Times-Roman": [250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444, 921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722, 556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500, 333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500, 500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541],
+    "Times-Bold": [250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 930, 722, 667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667, 944, 722, 778, 611, 778, 722, 556, 667, 722, 722, 1000, 722, 722, 667, 333, 278, 333, 581, 500, 333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333, 556, 278, 833, 556, 500, 556, 556, 444, 389, 333, 556, 500, 722, 500, 500, 444, 394, 220, 394, 520],
+    "Times-Italic": [250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500, 920, 611, 611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556, 833, 667, 722, 611, 722, 611, 500, 556, 722, 611, 833, 611, 556, 556, 389, 278, 389, 422, 500, 333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278, 444, 278, 722, 500, 500, 500, 500, 389, 389, 278, 500, 444, 667, 444, 444, 389, 400, 275, 400, 541],
+    "Times-BoldItalic": [250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 832, 667, 667, 667, 722, 667, 667, 722, 778, 389, 500, 667, 611, 889, 722, 722, 611, 722, 667, 556, 611, 722, 667, 889, 667, 611, 611, 333, 278, 333, 570, 500, 333, 500, 500, 444, 500, 444, 333, 500, 556, 278, 278, 500, 278, 778, 556, 500, 500, 500, 389, 389, 278, 556, 444, 667, 500, 444, 389, 348, 220, 348, 570],
+}
+STD_WIDTHS["Helvetica-Oblique"] = STD_WIDTHS["Helvetica"]
+STD_WIDTHS["Helvetica-BoldOblique"] = STD_WIDTHS["Helvetica-Bold"]
+for _n in ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"):
+    STD_WIDTHS[_n] = [600] * 95
+
+
+def mat_mul(m, n):
+    """Product of two PDF matrices (a, b, c, d, e, f), m applied first."""
+    a, b, c, d, e, f = m
+    A, B, C, D, E, F = n
+    return (a * A + b * C, a * B + b * D, c * A + d * C, c * B + d * D, e * A + f * C + E, e * B + f * D + F)
+
+
+def mat_inv(m):
+    a, b, c, d, e, f = m
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        return (1, 0, 0, 1, 0, 0)
+    return (d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det)
+
+
+def mat_apply(m, x, y):
+    a, b, c, d, e, f = m
+    return a * x + c * y + e, b * x + d * y + f
+
+
+def _num(v):
+    return float(v)
+
+
+# ---- fonts ------------------------------------------------------------------------ #
+def _parse_tounicode(data):
+    """A ToUnicode CMap: {code bytes: text}, and the code lengths it uses."""
+    import re as _re
+    out, lengths = {}, set()
+
+    def hexb(h):
+        return bytes.fromhex(h)
+
+    def hext(h):
+        try:
+            return bytes.fromhex(h).decode("utf-16-be", "replace")
+        except ValueError:
+            return ""
+    text = data.decode("latin-1")
+    for block in _re.findall(r"beginbfchar(.*?)endbfchar", text, _re.S):
+        for src, dst in _re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", block):
+            out[hexb(src)] = hext(dst)
+            lengths.add(len(src) // 2)
+    for block in _re.findall(r"beginbfrange(.*?)endbfrange", text, _re.S):
+        for lo, hi, rest in _re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(\[[^\]]*\]|<[0-9A-Fa-f]*>)", block):
+            n = len(lo) // 2
+            lengths.add(n)
+            a, b = int(lo, 16), int(hi, 16)
+            if rest.startswith("["):
+                dsts = _re.findall(r"<([0-9A-Fa-f]*)>", rest)
+                for i, code in enumerate(range(a, min(b, a + len(dsts) - 1) + 1)):
+                    out[code.to_bytes(n, "big")] = hext(dsts[i])
+            else:
+                base = int(rest[1:-1] or "0", 16)
+                width = max(2, len(rest) - 2) // 2
+                for i, code in enumerate(range(a, min(b, a + 65535) + 1)):
+                    try:
+                        out[code.to_bytes(n, "big")] = (base + i).to_bytes(width, "big").decode("utf-16-be", "replace")
+                    except OverflowError:
+                        break
+    return out, lengths
+
+
+class FontInfo:
+    """What's needed to read and write text in one font: code length, widths,
+    code -> text, and text -> code (for the characters the font has)."""
+    def __init__(self, font):
+        self.font = font
+        self.base = str(font.get("/BaseFont", "/Unknown"))[1:]
+        self.composite = font.get("/Subtype") == pikepdf.Name.Type0
+        self.widths, self.default_w = {}, 1000 if self.composite else 500
+        self.to_text, self.from_text = {}, {}
+        desc = None
+        if self.composite:
+            cid = font.DescendantFonts[0]
+            desc = cid.get("/FontDescriptor")
+            self.default_w = float(cid.get("/DW", 1000))
+            w = cid.get("/W")
+            if w is not None:
+                w = list(w)
+                i = 0
+                while i < len(w):
+                    first = int(w[i])
+                    if isinstance(w[i + 1], pikepdf.Array):
+                        for k, v in enumerate(w[i + 1]):
+                            self.widths[first + k] = float(v)
+                        i += 2
+                    else:
+                        last, v = int(w[i + 1]), float(w[i + 2])
+                        for k in range(first, last + 1):
+                            self.widths[k] = v
+                        i += 3
+            self.identity = font.get("/Encoding") in (pikepdf.Name("/Identity-H"), pikepdf.Name("/Identity-V"))
+            self.code_len = 2
+        else:
+            desc = font.get("/FontDescriptor")
+            fc = int(font.get("/FirstChar", 0))
+            for k, v in enumerate(font.get("/Widths", [])):
+                self.widths[fc + k] = float(v)
+            if not self.widths and self.base in STD_WIDTHS:
+                for k, v in enumerate(STD_WIDTHS[self.base]):
+                    self.widths[32 + k] = float(v)
+            self.code_len = 1
+            self.identity = False
+        self.ascent = float(desc.get("/Ascent", 800)) / 1000 if desc is not None else 0.8
+        self.descent = float(desc.get("/Descent", -200)) / 1000 if desc is not None else -0.2
+        if self.ascent <= 0.2:
+            self.ascent, self.descent = 0.8, -0.2
+        flags = int(desc.get("/Flags", 0)) if desc is not None else 0
+        name = self.base.lower()
+        self.bold = "bold" in name or "black" in name or "heavy" in name or "semibold" in name or bool(flags & (1 << 18))
+        self.italic = "italic" in name or "oblique" in name or bool(flags & 64) or \
+            (desc is not None and float(desc.get("/ItalicAngle", 0)) != 0)
+        self.mono = "courier" in name or "mono" in name or "consol" in name or bool(flags & 1)
+        self.serif = (not self.mono) and ("times" in name or "serif" in name and "sans" not in name or "georgia" in name
+                                          or "garamond" in name or "cambria" in name or "book" in name
+                                          or "minion" in name or "roman" in name or bool(flags & 2))
+        tu = font.get("/ToUnicode")
+        if isinstance(tu, pikepdf.Stream):
+            try:
+                self.to_text, lens = _parse_tounicode(tu.read_bytes())
+                if lens and not self.composite:
+                    self.code_len = min(lens)
+            except Exception:
+                self.to_text = {}
+        if not self.to_text and not self.composite:
+            enc = font.get("/Encoding")
+            for code in range(32, 256):
+                try:
+                    self.to_text[bytes([code])] = bytes([code]).decode("cp1252")
+                except UnicodeDecodeError:
+                    pass
+            if isinstance(enc, pikepdf.Dictionary) and "/Differences" in enc:
+                code = 0
+                for item in enc.Differences:
+                    if isinstance(item, int) or isinstance(item, float):
+                        code = int(item)
+                    else:
+                        ch = glyph_char(str(item)[1:])
+                        if ch:
+                            self.to_text[bytes([code])] = ch
+                        code += 1
+        for code, text in self.to_text.items():
+            if len(text) == 1 and text not in self.from_text:
+                self.from_text[text] = code
+
+    def codes(self, data):
+        """Split shown bytes into codes."""
+        n = self.code_len
+        return [data[i:i + n] for i in range(0, len(data) - n + 1, n)]
+
+    def width(self, code):
+        """Glyph width of a code, in 1/1000 em."""
+        return self.widths.get(int.from_bytes(code, "big"), self.default_w)
+
+    def text(self, code):
+        t = self.to_text.get(code)
+        if t is None:
+            t = chr(code[-1]) if not self.composite and 32 <= code[-1] < 127 else "�"
+        return t
+
+    def encode(self, text):
+        """Codes for text in this font, or None if it lacks a character."""
+        out = []
+        for ch in text:
+            code = self.from_text.get(ch)
+            if code is None:
+                if ch == " " and not self.composite and b" " in self.to_text:
+                    code = b" "
+                else:
+                    return None
+            out.append(code)
+        return out
+
+    def standard(self):
+        """The standard PDF font most like this one."""
+        family = "Courier" if self.mono else "Times" if self.serif else "Helvetica"
+        if family == "Times":
+            style = {(False, False): "-Roman", (True, False): "-Bold", (False, True): "-Italic", (True, True): "-BoldItalic"}
+        else:
+            style = {(False, False): "", (True, False): "-Bold", (False, True): "-Oblique", (True, True): "-BoldOblique"}
+        return family + style[(self.bold, self.italic)]
+
+
+_GLYPHS = {"space": " ", "hyphen": "-", "period": ".", "comma": ",", "colon": ":", "semicolon": ";",
+           "quoteright": "’", "quoteleft": "‘", "quotedblleft": "“", "quotedblright": "”",
+           "endash": "–", "emdash": "—", "bullet": "•", "ellipsis": "…", "exclam": "!",
+           "question": "?", "parenleft": "(", "parenright": ")", "slash": "/", "ampersand": "&", "at": "@",
+           "dollar": "$", "percent": "%", "quotesingle": "'", "quotedbl": '"', "fi": "fi", "fl": "fl",
+           "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+           "seven": "7", "eight": "8", "nine": "9"}
+
+
+def glyph_char(name):
+    if len(name) == 1:
+        return name
+    if name.startswith("uni") and len(name) == 7:
+        try:
+            return chr(int(name[3:], 16))
+        except ValueError:
+            return None
+    return _GLYPHS.get(name)
+
+
+# ---- reading a page ------------------------------------------------------------------ #
+def read_page_content(pdf, page):
+    """Interpret a page's operators. Returns (ops, glyphs, images, fonts):
+    each glyph is a dict with the op index, character, its baseline start and end
+    (page coordinates), size, font resource name and fill colour; each image is a
+    dict with the op index, resource name and the matrix placing its unit square."""
+    ops = list(pikepdf.parse_content_stream(page))
+    res = page.obj.get("/Resources", pikepdf.Dictionary())
+    fonts_res = res.get("/Font", pikepdf.Dictionary())
+    xobjs = res.get("/XObject", pikepdf.Dictionary())
+    fonts = {}
+    glyphs, images = [], []
+    gs = dict(ctm=(1, 0, 0, 1, 0, 0), fill=(0, 0, 0))
+    stack = []
+    ts = dict(font=None, size=12, tc=0, tw=0, th=1, tl=0, rise=0)
+    tm = tlm = (1, 0, 0, 1, 0, 0)
+    per_op = {}  # op index -> number of its last glyph
+
+    def font_info(name):
+        if name not in fonts:
+            f = fonts_res.get(name)
+            fonts[name] = FontInfo(f) if isinstance(f, pikepdf.Dictionary) else None
+        return fonts[name]
+
+    def show(i, data):
+        nonlocal tm
+        fi = font_info(ts["font"])
+        if fi is None:
+            return
+        size, th = ts["size"], ts["th"]
+        for code in fi.codes(bytes(data)):
+            seq = per_op[i] = per_op.get(i, -1) + 1
+            w0 = fi.width(code) / 1000
+            trm = mat_mul(mat_mul((size * th, 0, 0, size, 0, ts["rise"]), tm), gs["ctm"])
+            x0, y0 = mat_apply(trm, 0, 0)
+            tx = (w0 * size + ts["tc"] + (ts["tw"] if code == b" " or (fi.code_len == 1 and code == b"\x20") else 0)) * th
+            nm = mat_mul((1, 0, 0, 1, tx, 0), tm)
+            x1, y1 = mat_apply(mat_mul(mat_mul((size * th, 0, 0, size, 0, ts["rise"]), nm), gs["ctm"]), 0, 0)
+            # height direction of the glyph, in page units: the size as drawn
+            ux, uy = mat_apply(trm, 0, 1)
+            h = ((ux - x0) ** 2 + (uy - y0) ** 2) ** 0.5
+            glyphs.append(dict(op=i, seq=seq, ch=fi.text(code), x0=x0, y0=y0, x1=x1, y1=y1, size=h, font=ts["font"],
+                               fill=gs["fill"], ctm=gs["ctm"]))
+            tm = nm
+
+    for i, op in enumerate(ops):
+        o = str(op.operator)
+        a = op.operands
+        try:
+            if o == "q":
+                stack.append((dict(gs), dict(ts)))  # the text state is part of the graphics state
+            elif o == "Q":
+                if stack:
+                    gs, ts = stack.pop()
+            elif o == "cm":
+                gs["ctm"] = mat_mul(tuple(_num(v) for v in a), gs["ctm"])
+            elif o in ("rg", "sc", "scn") and len(a) == 3 and all(not isinstance(v, pikepdf.Name) for v in a):
+                gs["fill"] = tuple(_num(v) for v in a)
+            elif o in ("g", "sc", "scn") and len(a) == 1 and not isinstance(a[0], pikepdf.Name):
+                gs["fill"] = (_num(a[0]),) * 3
+            elif o in ("k",) and len(a) == 4:
+                c, m, y, k = (_num(v) for v in a)
+                gs["fill"] = ((1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k))
+            elif o == "BT":
+                tm = tlm = (1, 0, 0, 1, 0, 0)
+            elif o == "Tf":
+                ts["font"], ts["size"] = str(a[0]), _num(a[1])
+            elif o == "Tc":
+                ts["tc"] = _num(a[0])
+            elif o == "Tw":
+                ts["tw"] = _num(a[0])
+            elif o == "Tz":
+                ts["th"] = _num(a[0]) / 100
+            elif o == "TL":
+                ts["tl"] = _num(a[0])
+            elif o == "Ts":
+                ts["rise"] = _num(a[0])
+            elif o == "Td":
+                tlm = mat_mul((1, 0, 0, 1, _num(a[0]), _num(a[1])), tlm)
+                tm = tlm
+            elif o == "TD":
+                ts["tl"] = -_num(a[1])
+                tlm = mat_mul((1, 0, 0, 1, _num(a[0]), _num(a[1])), tlm)
+                tm = tlm
+            elif o == "Tm":
+                tlm = tm = tuple(_num(v) for v in a)
+            elif o == "T*":
+                tlm = mat_mul((1, 0, 0, 1, 0, -ts["tl"]), tlm)
+                tm = tlm
+            elif o == "Tj":
+                show(i, a[0])
+            elif o == "'":
+                tlm = mat_mul((1, 0, 0, 1, 0, -ts["tl"]), tlm)
+                tm = tlm
+                show(i, a[0])
+            elif o == '"':
+                ts["tw"], ts["tc"] = _num(a[0]), _num(a[1])
+                tlm = mat_mul((1, 0, 0, 1, 0, -ts["tl"]), tlm)
+                tm = tlm
+                show(i, a[2])
+            elif o == "TJ":
+                for item in a[0]:
+                    if isinstance(item, (pikepdf.String, bytes, str)):
+                        show(i, item)
+                    else:  # a number (int, Decimal...): move the pen back by that many 1/1000 em
+                        tm = mat_mul((1, 0, 0, 1, -float(item) / 1000 * ts["size"] * ts["th"], 0), tm)
+            elif o == "Do":
+                name = str(a[0])
+                x = xobjs.get(name)
+                if isinstance(x, pikepdf.Stream) and x.get("/Subtype") == pikepdf.Name.Image:
+                    images.append(dict(op=i, name=name, ctm=gs["ctm"]))
+        except Exception as e:  # an odd operator: skip it, keep reading
+            log_error(f"Read content op {o}: {type(e).__name__}: {e}")
+    return ops, glyphs, images, fonts
+
+
+def text_blocks(glyphs):
+    """Group glyphs into lines, and lines into paragraphs. Each paragraph:
+    dict(ops (op indices), text, lines (list of line dicts), box (x0, y0, x1, y1),
+    size, font, fill, angle)."""
+    import math
+    lines = []
+    for g in glyphs:
+        if g["ch"] in ("�",) or g["size"] <= 0:
+            continue
+        dx, dy = g["x1"] - g["x0"], g["y1"] - g["y0"]
+        ang = round(math.degrees(math.atan2(dy, dx)) / 90) * 90 % 360 if (dx or dy) else 0
+        cur = lines[-1] if lines else None
+        if cur and cur["angle"] == ang and abs(cur["size"] - g["size"]) < 0.6 * max(cur["size"], g["size"]):
+            # Same line if it continues along the baseline from the last glyph.
+            last = cur["glyphs"][-1]
+            ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+            along = (g["x0"] - last["x1"]) * ca + (g["y0"] - last["y1"]) * sa
+            across = -(g["x0"] - last["x1"]) * sa + (g["y0"] - last["y1"]) * ca
+            if abs(across) < 0.35 * g["size"] and -0.5 * g["size"] < along < 1.6 * g["size"]:
+                if along > 0.22 * g["size"] and last["ch"] != " " and g["ch"] != " ":
+                    cur["text"] += " "
+                cur["glyphs"].append(g)
+                cur["text"] += g["ch"]
+                continue
+        lines.append(dict(glyphs=[g], text=g["ch"], angle=ang, size=g["size"]))
+    for ln in lines:
+        gl = ln["glyphs"]
+        ln["text"] = ln["text"].rstrip()
+        xs = [v for g in gl for v in (g["x0"], g["x1"])]
+        ys = [v for g in gl for v in (g["y0"], g["y1"])]
+        ln["box"] = (min(xs), min(ys), max(xs), max(ys))
+        ln["start"] = (gl[0]["x0"], gl[0]["y0"])
+        ln["font"] = max(set(g["font"] for g in gl), key=lambda f: sum(1 for g in gl if g["font"] == f))
+        ln["size"] = sorted(g["size"] for g in gl)[len(gl) // 2]
+    lines = [ln for ln in lines if ln["text"].strip()]
+    paras = []
+    for ln in lines:
+        p = paras[-1] if paras else None
+        if p and p["angle"] == ln["angle"] == 0 and abs(p["size"] - ln["size"]) < 0.15 * ln["size"]:
+            prev = p["lines"][-1]
+            gap = prev["start"][1] - ln["start"][1]
+            left_ok = abs(prev["start"][0] - ln["start"][0]) < 1.5 * ln["size"]
+            if left_ok and 0.8 * ln["size"] < gap < 1.9 * ln["size"] and \
+                    (len(p["lines"]) == 1 or abs(gap - p["leading"]) < 0.25 * ln["size"]):
+                p["lines"].append(ln)
+                p["leading"] = gap
+                continue
+        paras.append(dict(lines=[ln], angle=ln["angle"], size=ln["size"], leading=ln["size"] * 1.2))
+    for p in paras:
+        gl = [g for ln in p["lines"] for g in ln["glyphs"]]
+        p["ops"] = sorted(set(g["op"] for g in gl))
+        p["glyph_ids"] = sorted((g["op"], g["seq"]) for g in gl)
+        p["text"] = " ".join(ln["text"].strip() for ln in p["lines"])
+        fonts = [g["font"] for g in gl if g["ch"] != " "] or [gl[0]["font"]]
+        p["font"] = max(set(fonts), key=fonts.count)
+        p["mixed"] = len(set(fonts)) > 1
+        fills = [g["fill"] for g in gl if g["ch"] != " "] or [(0, 0, 0)]
+        p["fill"] = max(set(fills), key=fills.count)
+        xs = [v for ln in p["lines"] for v in (ln["box"][0], ln["box"][2])]
+        ys = [v for ln in p["lines"] for v in (ln["box"][1], ln["box"][3])]
+        p["box"] = (min(xs), min(ys) - p["size"] * 0.25, max(xs), max(ys) + p["size"] * 0.8)
+        p["start"] = p["lines"][0]["start"]
+        p["width"] = max(ln["box"][2] - ln["start"][0] for ln in p["lines"]) if p["angle"] == 0 else 0
+    return paras
+
+
+def image_box(ctm):
+    pts = [mat_apply(ctm, x, y) for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+# ---- changing a page ------------------------------------------------------------------- #
+def _strip_glyphs(ops, fonts_res, drop):
+    """The page's operators with some glyphs no longer drawn. drop maps a text-showing
+    op's index to the set of its glyph numbers to remove. Each removed glyph becomes
+    an equal move of the pen (a TJ number), so everything else stays exactly where it was."""
+    out, fonts, stack = [], {}, []
+    ts = dict(font=None, size=12.0, tc=0.0, tw=0.0)
+    for i, op in enumerate(ops):
+        o = str(op.operator)
+        a = op.operands
+        if o == "q":
+            stack.append(dict(ts))
+        elif o == "Q" and stack:
+            ts = stack.pop()
+        elif o == "Tf":
+            ts["font"], ts["size"] = str(a[0]), float(a[1])
+        elif o == "Tc":
+            ts["tc"] = float(a[0])
+        elif o == "Tw":
+            ts["tw"] = float(a[0])
+        elif o == '"':
+            ts["tw"], ts["tc"] = float(a[0]), float(a[1])
+        if i not in drop:
+            out.append(op)
+            continue
+        name = ts["font"]
+        if name not in fonts:
+            f = fonts_res.get(name)
+            fonts[name] = FontInfo(f) if isinstance(f, pikepdf.Dictionary) else None
+        fi, size = fonts[name], ts["size"]
+        if fi is None or size == 0:
+            out.append(op)
+            continue
+        gone = drop[i]
+        items = list(a[0]) if o == "TJ" else [a[-1]]
+        arr, text, seq = [], b"", 0
+
+        def push_move(n):
+            nonlocal text
+            if text:
+                arr.append(pikepdf.String(text))
+                text = b""
+            if arr and not isinstance(arr[-1], pikepdf.String):
+                arr[-1] = arr[-1] + n
+            else:
+                arr.append(n)
+        for item in items:
+            if isinstance(item, (pikepdf.String, bytes, str)):
+                for code in fi.codes(bytes(item)):
+                    if seq in gone:
+                        adv = fi.width(code) / 1000 * size + ts["tc"] +                             (ts["tw"] if fi.code_len == 1 and code == b" " else 0)
+                        push_move(-adv * 1000 / size)
+                    else:
+                        text += code
+                    seq += 1
+            else:
+                push_move(float(item))
+        if text:
+            arr.append(pikepdf.String(text))
+        arr = [round(v, 3) if not isinstance(v, pikepdf.String) else v for v in arr]
+        if o == "'":
+            out.append(pikepdf.ContentStreamInstruction([], pikepdf.Operator("T*")))
+        elif o == '"':
+            out += [pikepdf.ContentStreamInstruction([a[0]], pikepdf.Operator("Tw")),
+                    pikepdf.ContentStreamInstruction([a[1]], pikepdf.Operator("Tc")),
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("T*"))]
+        out.append(pikepdf.ContentStreamInstruction([pikepdf.Array(arr)], pikepdf.Operator("TJ")))
+    return out
+
+
+def _std_font_dict(pdf, name):
+    return pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                                                BaseFont=pikepdf.Name("/" + name), Encoding=pikepdf.Name.WinAnsiEncoding))
+
+
+def _own_resources(page):
+    """The page's resources as its own copy (they may be shared with other pages)."""
+    res = page.obj.get("/Resources")
+    res = pikepdf.Dictionary(res) if isinstance(res, pikepdf.Dictionary) else pikepdf.Dictionary()
+    for k in ("/Font", "/XObject", "/ExtGState"):
+        if isinstance(res.get(k), pikepdf.Dictionary):
+            res[k] = pikepdf.Dictionary(res[k])
+    page.obj.Resources = res
+    return res
+
+
+def wrap_words(text, width_of, max_w):
+    """Greedy word wrap. width_of(str) -> points."""
+    lines = []
+    for para in text.split("\n"):
+        words, cur = para.split(" "), ""
+        for w in words:
+            trial = (cur + " " + w) if cur else w
+            if cur and width_of(trial) > max_w:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = trial
+        lines.append(cur)
+    return lines
+
+
+def write_page_ops(pdf, page, ops):
+    """Replace the page's content with these operators, starting and ending in the
+    default coordinate system (so anything added at the end is in page coordinates)."""
+    body = pikepdf.unparse_content_stream(ops)
+    page.obj.Contents = pdf.make_stream(body)
+
+
+def edit_paragraph(pdf, page, para, new_text, size=None):
+    """Replace a paragraph's text. Returns a note for the user (or "")."""
+    ops, glyphs, images, fonts = read_page_content(pdf, page)
+    remove = set(para["ops"])
+    if any(i >= len(ops) or str(ops[i].operator) not in ("Tj", "TJ", "'", '"') for i in remove):
+        raise ValueError("The page changed since it was read")
+    res = _own_resources(page)
+    drop = {}
+    for op_i, seq in para["glyph_ids"]:
+        drop.setdefault(op_i, set()).add(seq)
+    for op_i, seqs in drop.items():
+        # An op drawn only for this paragraph goes entirely (with any spaces or
+        # unreadable glyphs); one shared with other text loses just these glyphs.
+        rest = [g for g in glyphs if g["op"] == op_i and g["seq"] not in seqs]
+        if all(g["ch"] == "�" or not g["ch"].strip() for g in rest):
+            seqs.update(g["seq"] for g in rest)
+    new_ops = _strip_glyphs(ops, res.get("/Font", pikepdf.Dictionary()), drop)
+    note = ""
+    if new_text.strip():
+        fi = fonts.get(para["font"]) or FontInfo(res.Font[para["font"]])
+        size = size or para["size"]
+        codes = fi.encode(new_text.replace("\n", " "))
+        if codes is not None and not para["mixed"]:
+            font_name = para["font"]
+            width_of = lambda s: sum(fi.width(c) for c in fi.encode(s) or []) / 1000 * size  # noqa: E731
+
+            def encode(s):
+                return pikepdf.String(b"".join(fi.encode(s)))
+        else:
+            # The same font from this computer, if it's installed (only the needed
+            # letters are embedded); otherwise the closest standard PDF font.
+            sysfont = embed_system_font(pdf, fi.base, new_text) if _cp1252_ok(new_text) else None
+            if sysfont is not None:
+                fdict, widths, label = sysfont
+                n = 1
+                while f"/TKSys{n}" in res.Font:
+                    n += 1
+                font_name = f"/TKSys{n}"
+                res.Font[font_name] = fdict
+                width_of = lambda s: sum(widths.get(ch, 0.5) for ch in s) * size  # noqa: E731
+                note = ("" if not para["mixed"] else "This paragraph mixed several fonts; it now uses one.")
+            else:
+                std = fi.standard()
+                font_name = "/TKEdit" + std.replace("-", "")
+                res.Font[font_name] = _std_font_dict(pdf, std)
+                table = STD_WIDTHS[std]
+                width_of = lambda s: sum(table[ord(ch) - 32] if 32 <= ord(ch) < 127 else 556 for ch in s) / 1000 * size  # noqa: E731
+                label = std.split("-")[0]
+                note = (f"The original font isn't fully in this PDF or on this computer, so this paragraph now "
+                        f"uses {label}." if codes is None else "This paragraph mixed several fonts; it now uses one.")
+
+            def encode(s):
+                return pikepdf.String(s.encode("cp1252", "replace"))
+        x, y = para["start"]
+        max_w = max(para["width"], width_of("M" * 8)) * 1.01 + 0.5  # a hair of slack for rounding
+        if len(para["lines"]) == 1:
+            # A single line (a heading, a label) may grow toward the page's right
+            # margin; only multi-line paragraphs keep their column width.
+            mb = [float(v) for v in page.mediabox]
+            left = x - min(mb[0], mb[2])
+            room = max(mb[0], mb[2]) - x - max(18.0, min(left, 72.0))
+            max_w = max(max_w, room)
+        lines = wrap_words(new_text, width_of, max_w)
+        lead = para["leading"] if len(para["lines"]) > 1 else size * 1.2
+        r, g, b = para["fill"]
+        new_ops.append(pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")))
+        tail = [pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                pikepdf.ContentStreamInstruction([r, g, b], pikepdf.Operator("rg")),
+                pikepdf.ContentStreamInstruction([pikepdf.Name(font_name), size], pikepdf.Operator("Tf")),
+                pikepdf.ContentStreamInstruction([1, 0, 0, 1, x, y], pikepdf.Operator("Tm"))]
+        for k, line in enumerate(lines):
+            if k:
+                tail.append(pikepdf.ContentStreamInstruction([0, -lead], pikepdf.Operator("Td")))
+            tail.append(pikepdf.ContentStreamInstruction([encode(line)], pikepdf.Operator("Tj")))
+        tail += [pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+                 pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q"))]
+        if len(lines) > len(para["lines"]):
+            note = (note + " " if note else "") + "The new text is longer, so it runs below the original space."
+        new_ops += tail
+    _write_with_reset(pdf, page, new_ops, len(new_ops) - (len(tail) + 1 if new_text.strip() else 0))
+    return note
+
+
+def _write_with_reset(pdf, page, ops, n_original):
+    """Write ops, wrapping the original part in q/Q so additions start in page coordinates."""
+    q = pikepdf.ContentStreamInstruction([], pikepdf.Operator("q"))
+    Q = pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q"))
+    out = [q] + ops[:n_original] + [Q] + ops[n_original:]
+    write_page_ops(pdf, page, out)
+
+
+def add_text(pdf, page, x, y, text, size=12, font="Helvetica", fill=(0, 0, 0)):
+    """New text (real page text, not a comment) with its top-left near (x, y), page coordinates."""
+    ops = list(pikepdf.parse_content_stream(page))
+    res = _own_resources(page)
+    if "/Font" not in res:
+        res.Font = pikepdf.Dictionary()
+    name = "/TKEdit" + font.replace("-", "")
+    res.Font[name] = _std_font_dict(pdf, font)
+    lines = text.split("\n")
+    tail = [pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+            pikepdf.ContentStreamInstruction(list(fill), pikepdf.Operator("rg")),
+            pikepdf.ContentStreamInstruction([pikepdf.Name(name), size], pikepdf.Operator("Tf")),
+            pikepdf.ContentStreamInstruction([1, 0, 0, 1, x, y - size * 0.8], pikepdf.Operator("Tm"))]
+    for k, line in enumerate(lines):
+        if k:
+            tail.append(pikepdf.ContentStreamInstruction([0, -size * 1.2], pikepdf.Operator("Td")))
+        tail.append(pikepdf.ContentStreamInstruction([pikepdf.String(line.encode("cp1252", "replace"))],
+                                                     pikepdf.Operator("Tj")))
+    tail.append(pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")))
+    _write_with_reset(pdf, page, ops + [pikepdf.ContentStreamInstruction([], pikepdf.Operator("q"))] + tail +
+                      [pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q"))], len(ops))
+
+
+def edit_image(pdf, page, image, new_box=None, delete=False, replace_with=None):
+    """Move/resize an image to new_box (page coordinates), delete it, or swap its picture."""
+    ops = list(pikepdf.parse_content_stream(page))
+    i = image["op"]
+    if not (i < len(ops) and str(ops[i].operator) == "Do" and str(ops[i].operands[0]) == image["name"]):
+        raise ValueError("The page changed since it was read")
+    res = _own_resources(page)
+    if delete:
+        ops[i] = pikepdf.ContentStreamInstruction([], pikepdf.Operator("n"))  # a no-op outside a path
+        del ops[i]
+        write_page_ops(pdf, page, ops)
+        return
+    name = image["name"]
+    old = image_box(image["ctm"])
+    box = new_box or old
+    if replace_with is not None:
+        xo = _image_xobject(pdf, replace_with)
+        n = 1
+        while f"/TKImg{n}" in res.XObject:
+            n += 1
+        name = f"/TKImg{n}"
+        res.XObject[name] = xo
+        # Fit the new picture inside the box, keeping its proportions.
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        iw, ih = replace_with.size
+        s = min(bw / iw, bh / ih)
+        w, h = iw * s, ih * s
+        box = (box[0] + (bw - w) / 2, box[1] + (bh - h) / 2, box[0] + (bw + w) / 2, box[1] + (bh + h) / 2)
+        # Draw it upright in its box, whatever the old placement was.
+        ctm_new = (box[2] - box[0], 0, 0, box[3] - box[1], box[0], box[1])
+    else:
+        # The same picture, scaled and moved so its box becomes `box`.
+        ow, oh = old[2] - old[0], old[3] - old[1]
+        sx = (box[2] - box[0]) / ow if ow else 1
+        sy = (box[3] - box[1]) / oh if oh else 1
+        T = (sx, 0, 0, sy, box[0] - old[0] * sx, box[1] - old[1] * sy)
+        ctm_new = mat_mul(image["ctm"], T)
+    # cm X sets CTM := X × CTM, so X = CTM_new × CTM⁻¹ makes the image land in its new place.
+    X = mat_mul(ctm_new, mat_inv(image["ctm"]))
+    ops[i:i + 1] = [pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+                    pikepdf.ContentStreamInstruction([round(v, 6) for v in X], pikepdf.Operator("cm")),
+                    pikepdf.ContentStreamInstruction([pikepdf.Name(name)], pikepdf.Operator("Do")),
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q"))]
+    write_page_ops(pdf, page, ops)
+
+
+def add_image(pdf, page, im, box):
+    ops = list(pikepdf.parse_content_stream(page))
+    res = _own_resources(page)
+    if "/XObject" not in res:
+        res.XObject = pikepdf.Dictionary()
+    n = 1
+    while f"/TKImg{n}" in res.XObject:
+        n += 1
+    res.XObject[f"/TKImg{n}"] = _image_xobject(pdf, im)
+    tail = [pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+            pikepdf.ContentStreamInstruction([box[2] - box[0], 0, 0, box[3] - box[1], box[0], box[1]], pikepdf.Operator("cm")),
+            pikepdf.ContentStreamInstruction([pikepdf.Name(f"/TKImg{n}")], pikepdf.Operator("Do")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q"))]
+    _write_with_reset(pdf, page, ops + tail, len(ops))
+
+
+def _image_xobject(pdf, im):
+    """An image as a PDF image (JPEG for photos, lossless with transparency otherwise)."""
+    has_alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+    if has_alpha:
+        rgba = im.convert("RGBA")
+        xo = pdf.make_stream(zlib.compress(rgba.convert("RGB").tobytes(), 6), Type=pikepdf.Name.XObject,
+                             Subtype=pikepdf.Name.Image, Width=im.width, Height=im.height,
+                             ColorSpace=pikepdf.Name.DeviceRGB, BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
+        xo.SMask = pdf.make_stream(zlib.compress(rgba.getchannel("A").tobytes(), 6), Type=pikepdf.Name.XObject,
+                                   Subtype=pikepdf.Name.Image, Width=im.width, Height=im.height,
+                                   ColorSpace=pikepdf.Name.DeviceGray, BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
+        return xo
+    buf = io.BytesIO()
+    im.convert("RGB").save(buf, "JPEG", quality=90)
+    return pdf.make_stream(buf.getvalue(), Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
+                           Width=im.width, Height=im.height, ColorSpace=pikepdf.Name.DeviceRGB, BitsPerComponent=8,
+                           Filter=pikepdf.Name.DCTDecode)
+
+
+# ---- the same font from this computer ---------------------------------------------- #
+_SYS_FONTS = None
+
+
+def _norm(name):
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _cp1252_ok(text):
+    try:
+        text.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def system_fonts():
+    """Installed TrueType fonts: {normalised PostScript name or family+style: (path, index)}.
+    Scanned once (reading only each font's name table)."""
+    global _SYS_FONTS
+    if _SYS_FONTS is not None:
+        return _SYS_FONTS
+    from fontTools.ttLib import TTCollection, TTFont
+    if sys.platform == "win32":
+        dirs = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")]
+    elif sys.platform == "darwin":
+        dirs = ["/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts",
+                os.path.expanduser("~/Library/Fonts")]
+    else:
+        dirs = ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+                os.path.expanduser("~/.local/share/fonts")]
+    index = {}
+    for d in dirs:
+        for root_dir, _, files in os.walk(d):
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in (".ttf", ".ttc"):
+                    continue
+                path = os.path.join(root_dir, fn)
+                try:
+                    fonts = TTCollection(path, lazy=True).fonts if ext == ".ttc" else [TTFont(path, lazy=True)]
+                except Exception:
+                    continue
+                for k, f in enumerate(fonts):
+                    try:
+                        if "glyf" not in f:
+                            continue  # CFF outlines: not embeddable as a simple TrueType font
+                        names = f["name"]
+                        ps = names.getDebugName(6) or ""
+                        fam = names.getDebugName(16) or names.getDebugName(1) or ""
+                        sty = names.getDebugName(17) or names.getDebugName(2) or "Regular"
+                        keys = [_norm(ps), _norm(fam + sty)]
+                        if _norm(sty) == "regular":
+                            keys.append(_norm(fam))
+                        for key in keys:
+                            if key and key not in index:
+                                index[key] = (path, k)
+                    except Exception:
+                        continue
+    _SYS_FONTS = index
+    return index
+
+
+def find_system_font(base):
+    """The installed font matching a PDF font name like 'BAAAAA+TimesNewRomanPS-BoldMT'."""
+    name = base.split("+", 1)[-1]
+    fonts = system_fonts()
+    for cand in (name, name.replace(",", "-"), name.replace("PSMT", "").replace("MT", "").replace("PS", "")):
+        hit = fonts.get(_norm(cand))
+        if hit:
+            return hit
+    return None
+
+
+def _winansi_tounicode():
+    """A ToUnicode CMap for WinAnsi codes 32-255, so copied/searched text is right."""
+    pairs = []
+    for code in range(32, 256):
+        try:
+            ch = bytes([code]).decode("cp1252")
+        except UnicodeDecodeError:
+            continue
+        pairs.append(f"<{code:02X}> <{ord(ch):04X}>")
+    body = []
+    for k in range(0, len(pairs), 100):
+        chunk = pairs[k:k + 100]
+        body.append(f"{len(chunk)} beginbfchar\n" + "\n".join(chunk) + "\nendbfchar")
+    return ("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+            "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+            "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n" + "\n".join(body) +
+            "\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n").encode("ascii")
+
+
+def embed_system_font(pdf, base, text):
+    """Embed just the letters `text` needs from the installed font matching `base`.
+    Returns (font dictionary, {char: width in em}, PostScript name), or None if
+    there's no matching font or its licence doesn't allow embedding."""
+    hit = find_system_font(base)
+    if hit is None:
+        return None
+    try:
+        import logging
+        import random
+        from fontTools import subset
+        logging.getLogger("fontTools").setLevel(logging.ERROR)
+        from fontTools.ttLib import TTFont
+        font = TTFont(hit[0], fontNumber=hit[1])
+        fs_type = font["OS/2"].fsType if "OS/2" in font else 0
+        if fs_type & 0x0002 or fs_type & 0x0200:
+            return None  # "restricted licence" or "bitmap only": embedding not allowed
+        upm = font["head"].unitsPerEm
+        opts = subset.Options()
+        opts.layout_features = []
+        opts.name_IDs = ["*"]
+        opts.notdef_outline = True
+        opts.recalc_bounds = True
+        sub = subset.Subsetter(opts)
+        sub.populate(unicodes=[ord(c) for c in set(text) | {" "}])
+        sub.subset(font)
+        cmap = font.getBestCmap() or {}
+        hmtx = font["hmtx"]
+        widths, wlist = {}, []
+        for code in range(32, 256):
+            try:
+                ch = bytes([code]).decode("cp1252")
+            except UnicodeDecodeError:
+                wlist.append(0)
+                continue
+            g = cmap.get(ord(ch))
+            w = hmtx[g][0] * 1000 / upm if g else 0
+            wlist.append(round(w))
+            if g:
+                widths[ch] = w / 1000
+        buf = io.BytesIO()
+        font.save(buf)
+        data = buf.getvalue()
+        head, hhea = font["head"], font["hhea"]
+        os2 = font["OS/2"] if "OS/2" in font else None
+        italic = font["post"].italicAngle if "post" in font else 0
+        ps = (font["name"].getDebugName(6) or base.split("+", 1)[-1]).replace(" ", "")
+        tag = "".join(random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(6))
+        sc = 1000 / upm
+        desc = pikepdf.Dictionary(
+            Type=pikepdf.Name.FontDescriptor, FontName=pikepdf.Name(f"/{tag}+{ps}"), Flags=32 | (64 if italic else 0),
+            FontBBox=[round(head.xMin * sc), round(head.yMin * sc), round(head.xMax * sc), round(head.yMax * sc)],
+            ItalicAngle=float(italic), Ascent=round(hhea.ascent * sc), Descent=round(hhea.descent * sc),
+            CapHeight=round((getattr(os2, "sCapHeight", 0) or hhea.ascent * 0.7) * sc), StemV=80,
+            FontFile2=pdf.make_stream(data, Length1=len(data)))
+        fdict = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.TrueType, BaseFont=pikepdf.Name(f"/{tag}+{ps}"),
+            FirstChar=32, LastChar=255, Widths=wlist, Encoding=pikepdf.Name.WinAnsiEncoding,
+            FontDescriptor=pdf.make_indirect(desc)))
+        fdict.ToUnicode = pdf.make_stream(_winansi_tounicode())
+        return fdict, widths, ps
+    except Exception as e:
+        log_error(f"Embed font {base}: {type(e).__name__}: {e}")
+        return None
+
+
 def explain_error(e):
     name = type(e).__name__
     if isinstance(e, PermissionError):
@@ -1421,6 +2308,7 @@ class ToolkitApp:
         self.mode_btns = []
         for label, cmd, tip in (("Organize", None, "Arrange, rotate, crop and combine pages"),
                                 ("View", lambda: self.open_editor("view"), "Read, search and copy text"),
+                                ("Edit PDF", lambda: self.open_editor("edit"), "Change the pages' own text and pictures"),
                                 ("Comment", lambda: self.open_editor("comment"), "Highlight, notes, shapes, drawing"),
                                 ("Fill & Sign", lambda: self.open_editor("fill"), "Fill in forms and sign"),
                                 ("Prepare form", lambda: self.open_editor("form"), "Add fillable fields"),
@@ -2267,6 +3155,27 @@ class ToolkitApp:
             return
         ks = [k for k, p in enumerate(self.pages) if p["uid"] in self.selected]
         PageEditor(self, ks[0] if ks else 0, mode)
+
+    def edit_page_content(self, k, action, message):
+        """Change workspace page k's own content: action(pdf, page) runs on a copy of
+        the page's document, and the page then shows that copy (one undo step, and
+        the original file is untouched). Returns what action returns."""
+        p = self.pages[k]
+        doc = self.docs[p["doc"]]
+        with pikepdf.open(io.BytesIO(doc.data), password=doc.password) as pdf:
+            result = action(pdf, pdf.pages[p["index"]])
+            buf = io.BytesIO()
+            pdf.save(buf)
+        data = buf.getvalue()
+        did = self.next_doc
+        self.next_doc += 1
+        self.docs[did] = Doc(doc.path, data, "", open_pdf_bytes(data), name=doc.name)
+        if self.fill.get(p["doc"]):
+            self.fill[did] = dict(self.fill[p["doc"]])  # filled-in form values carry over
+        pages = list(self.pages)
+        pages[k] = dict(p, doc=did)
+        self._change(pages, message)
+        return result
 
     def _signatures(self, doc_id):
         """The certificate signatures already in a source file (checked once)."""
@@ -3253,7 +4162,8 @@ class CertificateDialog:
 class PageEditor:
     """One page at a time, large: view and search, comment, fill in and sign,
     and prepare forms. Everything placed here is added to the PDF when saving."""
-    MODES = (("view", "View"), ("comment", "Comment"), ("fill", "Fill & Sign"), ("form", "Prepare form"))
+    MODES = (("view", "View"), ("edit", "Edit PDF"), ("comment", "Comment"), ("fill", "Fill & Sign"),
+             ("form", "Prepare form"))
     FILL_TOOLS = (("text", "Ab", "Add text"), ("check", "✓", "Add a tick"), ("cross", "✗", "Add a cross"),
                   ("date", "📅", "Add today's date"))
     COMMENT_TOOLS = (("highlight", "🖍", "Highlight text (drag over it)"), ("underline", "U̲", "Underline text"),
@@ -3275,13 +4185,17 @@ class PageEditor:
         self.selection = None  # (page uid, start char, count)
         self.matches, self.match_i = [], -1
         self.color = "Yellow"
+        self.layout = {}  # (doc, index) -> (paragraphs, images) for Edit PDF
+        self.esel = None  # index of the selected image in Edit PDF
+        self.para_edit = None  # the text being edited in Edit PDF
+        self.new_image = None  # picture waiting to be placed
         self.before = app._fill_state()
         w = self.win = tk.Toplevel(app.root)
         w.title("PDF Toolkit — editor")
         w.configure(bg=UI["canvas"])
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
         w.geometry(f"{min(1240, sw - 80)}x{min(920, sh - 100)}")
-        w.minsize(900, 600)
+        w.minsize(1000, 600)
         w.transient(app.root)
         w.protocol("WM_DELETE_WINDOW", self.done)
 
@@ -3356,6 +4270,7 @@ class PageEditor:
         mod = "Command" if sys.platform == "darwin" else "Control"
         w.bind(f"<{mod}-c>", lambda e: self.copy() if not isinstance(e.widget, typing) else None)
         w.bind(f"<{mod}-f>", lambda e: (self.search_e.focus_set(), self.search_e.select_range(0, "end")))
+        w.bind(f"<{mod}-z>", lambda e: self.edit_undo() if self.mode == "edit" and not isinstance(e.widget, typing) else None)
         self.set_mode(mode)
         center_over(w, app.root)
         w.after(60, self.show)
@@ -3403,6 +4318,22 @@ class PageEditor:
             self.sign_btn = FlatButton(t, "✍  Sign ▾", self.sign_menu, UI["toolbar"], font=UI["bold"],
                                        tip="Your signature or initials, or a certificate signature")
             self.sign_btn.pack(side="left")
+        elif mode == "edit":
+            b = FlatButton(t, "＋ Text", lambda: self.set_tool("addtext"), UI["toolbar"], font=UI["bold"], padx=9,
+                           tip="Add new text to the page")
+            b.pack(side="left", padx=(8, 1), pady=4)
+            self.tool_btns["addtext"] = b
+            b = FlatButton(t, "＋ Image", self.pick_new_image, UI["toolbar"], font=UI["bold"], padx=9,
+                           tip="Add a picture to the page")
+            b.pack(side="left", padx=1, pady=4)
+            self.tool_btns["addimage"] = b
+            FlatButton(t, "Replace image", self.replace_image, UI["toolbar"], font=UI["bold"], padx=9,
+                       tip="Swap the selected picture for another").pack(side="left", padx=1, pady=4)
+            tk.Frame(t, bg=UI["border"], width=1).pack(side="left", fill="y", padx=8, pady=9)
+            for icon, fn, tip in (("A−", lambda: self.resize(-1), "Smaller text"), ("A+", lambda: self.resize(1), "Bigger text")):
+                FlatButton(t, icon, fn, UI["toolbar"], font=UI["bold"], padx=8, tip=tip).pack(side="left")
+            FlatButton(t, "↶", self.edit_undo, UI["toolbar"], font=UI["icon"], padx=9,
+                       tip="Undo the last change (Ctrl+Z)").pack(side="left", padx=1)
         elif mode == "form":
             for key, label in self.FORM_TOOLS:
                 b = FlatButton(t, "＋ " + label, lambda k=key: self.set_tool(k), UI["toolbar"], font=UI["bold"], padx=9)
@@ -3445,6 +4376,9 @@ class PageEditor:
             ("fill", "signature"): "Click where your signature goes.", ("fill", "initials"): "Click where your initials go.",
             ("fill", "certificate"): "Drag a box where the certificate signature goes.",
             ("form", None): "Choose a field type, then drag a box on the page (click for a checkbox).",
+            ("edit", None): "Click text to change it. Click a picture to move it; drag its corner to resize it.",
+            ("edit", "addtext"): "Click where the new text goes, then type.",
+            ("edit", "addimage"): "Click where the picture goes, or drag a box for its size.",
         }
         self.hint.config(text=hints.get((self.mode, tool), "Drag a box on the page." if self.mode == "form" else ""))
         if self.mode == "form":
@@ -3478,6 +4412,7 @@ class PageEditor:
         if 0 <= k < len(self.app.pages) and k != self.k:
             self.k = k
             self.select(None)
+            self.esel = None
             self.selection = None
             self.canvas.yview_moveto(0 if step >= 0 else 1)
             self.show()
@@ -3543,6 +4478,8 @@ class PageEditor:
             self.draw_mark(m)
         self.draw_selection()
         self.draw_matches()
+        if self.mode == "edit":
+            self.draw_layout(p)
         if self.sel:
             self.select(self.sel)
 
@@ -4035,6 +4972,7 @@ class PageEditor:
         e.bind("<FocusOut>", lambda ev: self.win.after(1, self.commit_edit))
 
     def commit_edit(self):
+        self.commit_para_edit()
         if not self.editing:
             return
         m, var, e, win, new, x0, cy = self.editing
@@ -4056,6 +4994,16 @@ class PageEditor:
         self.select(("mark", m["id"]))
 
     def resize(self, step):
+        if self.mode == "edit":
+            pe = self.para_edit
+            if pe is None:
+                self.hint.config(text="Click into some text first, or choose ＋ Text.")
+                return
+            pe["size"] = max(4, min(96, round(pe["size"] * (1.1 if step > 0 else 1 / 1.1), 1)))
+            pe["font"].configure(size=-max(4, round(pe["size"] * self.s)))
+            self.fit_para_box()
+            pe["text"].focus_set()
+            return
         m = self.selected_mark()
         if m is None:
             self.hint.config(text="Select an item on the page first (click it).")
@@ -4069,6 +5017,9 @@ class PageEditor:
         self.show()
 
     def delete_sel(self):
+        if self.mode == "edit":
+            self.edit_delete()
+            return
         if self.sel is None:
             return
         uid = self.page()["uid"]
@@ -4109,6 +5060,9 @@ class PageEditor:
         self.canvas.focus_set()
         cx, cy = self.ev(e)
         self.drag = None
+        if self.mode == "edit":
+            self.edit_press(cx, cy)
+            return
         hit = self._hit(cx, cy)
         movable = hit and ((hit[0] == "field" and self.mode == "form") or
                            (hit[0] == "mark" and self.mode in ("comment", "fill")))
@@ -4143,7 +5097,9 @@ class PageEditor:
         if not d:
             return
         cx, cy = self.ev(e)
-        if d["kind"] == "move":
+        if d["kind"].startswith("e"):
+            self.edit_drag(d, cx, cy)
+        elif d["kind"] == "move":
             if not d["moved"] and abs(cx - d["x"]) + abs(cy - d["y"]) < 3:
                 return
             d["moved"] = True
@@ -4180,7 +5136,9 @@ class PageEditor:
         d, self.drag = self.drag, None
         if not d:
             return
-        if d["kind"] == "move" and d["moved"]:
+        if d["kind"].startswith("e"):
+            self.edit_release(d)
+        elif d["kind"] == "move" and d["moved"]:
             x, y = self.from_canvas(*self.ev(e))
             item = self.selected_mark() if self.sel[0] == "mark" else self.selected_field()
             if item is not None:
@@ -4262,6 +5220,338 @@ class PageEditor:
             self.go(-1)
         else:
             self.canvas.yview_scroll(int(step) * 2, "units")
+
+    # ---- Edit PDF: the page's own text and pictures ------------------------------ #
+    def page_layout(self, p=None):
+        """The page's paragraphs and images (read once per version of the page)."""
+        p = p or self.page()
+        key = (p["doc"], p["index"])
+        if key not in self.layout:
+            doc = self.app.docs[p["doc"]]
+            paras, images = [], []
+            try:
+                with pikepdf.open(io.BytesIO(doc.data), password=doc.password) as pdf:
+                    _, glyphs, images, fonts = read_page_content(pdf, pdf.pages[p["index"]])
+                    paras = [q for q in text_blocks(glyphs) if q["angle"] == 0 and q["text"].strip()]
+                    for q in paras:
+                        fi = fonts.get(q["font"])
+                        q["style"] = (fi.serif, fi.mono, fi.bold, fi.italic, fi.base) if fi else \
+                            (False, False, False, False, "")
+            except Exception as e:
+                log_error(f"Read page layout: {type(e).__name__}: {e}")
+            self.layout[key] = (paras, images)
+        return self.layout[key]
+
+    def draw_layout(self, p):
+        c = self.canvas
+        if self.app._total_rot(p) != 0:
+            self.hint.config(text="This page is turned. Turn it upright (in Organize) to edit its text and pictures.")
+            return
+        paras, images = self.page_layout(p)
+        for k, im in enumerate(images):
+            x0, y0, x1, y1 = self.canvas_rect(image_box(im["ctm"]))
+            if k == self.esel:
+                c.create_rectangle(x0, y0, x1, y1, outline=UI["accent"], width=2, tags=("lay", "esel"))
+                c.create_rectangle(x1 - 5, y1 - 5, x1 + 5, y1 + 5, fill="#ffffff", outline=UI["accent"], width=2,
+                                   tags=("lay", "esel"))
+            else:
+                c.create_rectangle(x0, y0, x1, y1, outline="#9db7e0", dash=(3, 3), tags="lay")
+        for q in paras:
+            x0, y0, x1, y1 = self.canvas_rect(q["box"])
+            c.create_rectangle(x0 - 3, y0 - 1, x1 + 3, y1 + 1, outline="#9db7e0", dash=(3, 3), tags="lay")
+
+    def _display_family(self, style):
+        """A screen font that looks like the PDF's font (the same one if it's installed)."""
+        serif, mono, bold, italic, base = style
+        cache = PageEditor._families = getattr(PageEditor, "_families", {})
+        if base not in cache:
+            fam = None
+            try:
+                hit = find_system_font(base) if base else None
+                if hit:
+                    from fontTools.ttLib import TTCollection, TTFont
+                    f = TTCollection(hit[0], lazy=True).fonts[hit[1]] if hit[0].lower().endswith(".ttc") else \
+                        TTFont(hit[0], lazy=True)
+                    fam = f["name"].getDebugName(1)
+                    if fam not in tkfont.families(self.win):
+                        fam = None
+            except Exception:
+                fam = None
+            if not fam:
+                if sys.platform == "darwin":
+                    fam = "Courier" if mono else "Times" if serif else "Helvetica"
+                else:
+                    fam = "Courier New" if mono else "Times New Roman" if serif else "Arial"
+            cache[base] = fam
+        return cache[base]
+
+    def edit_press(self, cx, cy):
+        p = self.page()
+        if self.app._total_rot(p) != 0 or not self.on_page(cx, cy):
+            self.select_image(None)
+            return
+        if self.tool == "addtext":
+            self.set_tool(None)
+            self.start_para_edit(None, cx, cy)
+            return
+        if self.tool == "addimage":
+            self.drag = dict(kind="enew", x=cx, y=cy, item=None, end=(cx, cy))
+            return
+        paras, images = self.page_layout()
+        if self.esel is not None and self.esel < len(images):
+            b = self.canvas_rect(image_box(images[self.esel]["ctm"]))
+            if abs(cx - b[2]) <= 8 and abs(cy - b[3]) <= 8:
+                self.drag = dict(kind="eresize", box=b, item=None, end=b)
+                return
+        x, y = self.from_canvas(cx, cy)
+        for q in paras:
+            b = q["box"]
+            if b[0] - 2 <= x <= b[2] + 2 and b[1] <= y <= b[3]:
+                self.select_image(None)
+                self.start_para_edit(q, cx, cy)
+                return
+        for k in reversed(range(len(images))):
+            b = image_box(images[k]["ctm"])
+            if b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+                self.select_image(k)
+                self.drag = dict(kind="emove", x=cx, y=cy, dx=0, dy=0, box=self.canvas_rect(b))
+                return
+        self.select_image(None)
+
+    def select_image(self, k):
+        if k != self.esel:
+            self.esel = k
+            self.canvas.delete("lay")
+            self.draw_layout(self.page())
+        if k is not None:
+            self.hint.config(text="Drag to move it; drag the corner to resize. Del removes it; Replace image swaps it.")
+
+    def edit_drag(self, d, cx, cy):
+        c = self.canvas
+        if d["kind"] == "emove":
+            c.move("esel", cx - d["x"] - d["dx"], cy - d["y"] - d["dy"])
+            d["dx"], d["dy"] = cx - d["x"], cy - d["y"]
+            return
+        if d["item"]:
+            c.delete(d["item"])
+        if d["kind"] == "eresize":
+            x0, y0, x1, y1 = d["box"]
+            ratio = (y1 - y0) / max(1, x1 - x0)
+            w = max(12, cx - x0)
+            if (cy - y0) / ratio > w:  # follow whichever way the corner went further
+                w = max(12, (cy - y0) / ratio)
+            d["end"] = (x0, y0, x0 + w, y0 + w * ratio)
+            d["item"] = c.create_rectangle(*d["end"], outline=UI["accent"], width=2, dash=(4, 2))
+        else:  # enew
+            d["end"] = (cx, cy)
+            d["item"] = c.create_rectangle(d["x"], d["y"], cx, cy, outline=UI["accent"], width=2, dash=(4, 2))
+
+    def edit_release(self, d):
+        if d.get("item"):
+            self.canvas.delete(d["item"])
+        k = self.esel
+        if d["kind"] == "emove":
+            if abs(d["dx"]) + abs(d["dy"]) < 3:
+                self.canvas.move("esel", -d["dx"], -d["dy"])
+                return
+            x0, y0, x1, y1 = d["box"]
+            box = self.page_rect(x0 + d["dx"], y0 + d["dy"], x1 + d["dx"], y1 + d["dy"])
+            img = self.page_layout()[1][k]
+            self.apply_edit(lambda pdf, page: edit_image(pdf, page, img, new_box=box), "Moved a picture.")
+        elif d["kind"] == "eresize":
+            if d["end"] == d["box"]:
+                return
+            box = self.page_rect(*d["end"])
+            img = self.page_layout()[1][k]
+            self.apply_edit(lambda pdf, page: edit_image(pdf, page, img, new_box=box), "Resized a picture.")
+        elif d["kind"] == "enew" and self.new_image is not None:
+            im, self.new_image = self.new_image, None
+            self.set_tool(None)
+            (x0, y0), (x1, y1) = (d["x"], d["y"]), d["end"]
+            if abs(x1 - x0) < 8 or abs(y1 - y0) < 8:
+                # A click: the picture's own size (96 per inch), at most half the page wide.
+                bx = self.app._page_box(self.page())
+                w = min(im.width * 0.75, (bx[2] - bx[0]) * 0.5)
+                h = w * im.height / im.width
+                px, py = self.from_canvas(x0, y0)
+                box = (px, py - h, px + w, py)
+            else:
+                bx0, by0, bx1, by1 = self.page_rect(x0, y0, x1, y1)
+                s = min((bx1 - bx0) / im.width, (by1 - by0) / im.height)
+                w, h = im.width * s, im.height * s
+                box = (bx0, by1 - h, bx0 + w, by1)
+            n = len(self.page_layout()[1])
+            if self.apply_edit(lambda pdf, page: add_image(pdf, page, im, box), "Added a picture.") is not False:
+                self.select_image(n if n < len(self.page_layout()[1]) else None)
+
+    def apply_edit(self, action, message):
+        """Make one change to the page's content. Returns the action's result, or False if it failed."""
+        self.win.config(cursor="watch")
+        self.win.update_idletasks()
+        try:
+            result = self.app.edit_page_content(self.k, action, message)
+        except Exception as e:
+            log_error(f"Edit page: {type(e).__name__}: {e}")
+            messagebox.showerror("Edit PDF", f"That change couldn't be made.\n\n{explain_error(e)}", parent=self.win)
+            return False
+        finally:
+            self.win.config(cursor="")
+        self.textpages.pop((self.page()["doc"], self.page()["index"]), None)
+        self.show()
+        return result
+
+    def start_para_edit(self, para, cx, cy):
+        """Type over a paragraph (or new text) in place."""
+        if para is not None:
+            style, size = para["style"], para["size"]
+            text = para["text"]
+            lead = para["leading"] if len(para["lines"]) > 1 else size * 1.2
+            bx = self.app._page_box(self.page())
+            if len(para["lines"]) > 1:
+                width = para["width"] * 1.01
+            else:  # one line may grow toward the right margin, as it will in the PDF
+                left = para["start"][0] - bx[0]
+                width = max(para["width"] * 1.01, bx[2] - para["start"][0] - max(18.0, min(left, 72.0)))
+            x, top = self.to_canvas(para["start"][0], para["start"][1])
+            fill = _hex(para["fill"])
+            if para.get("mixed"):
+                self.hint.config(text="This text mixes fonts (like bold words). After editing it uses one font.")
+            else:
+                self.hint.config(text="Type your changes. Click outside (or Ctrl+Enter) to apply; Esc cancels.")
+        else:
+            style, size, text, fill = (False, False, False, False, ""), 12.0, "", "#000000"
+            lead = size * 1.2
+            bx = self.app._page_box(self.page())
+            px, py = self.from_canvas(cx, cy)
+            width = max(120.0, bx[2] - px - 36)
+            x, top = cx, None
+            self.hint.config(text="Type the new text. Click outside (or Ctrl+Enter) to add it; Esc cancels.")
+        font = tkfont.Font(self.win, family=self._display_family(style), size=-max(4, round(size * self.s)),
+                           weight="bold" if style[2] else "normal", slant="italic" if style[3] else "roman")
+        if top is not None:
+            top -= font.metrics("ascent")  # the first line's baseline lands on the PDF's
+        else:
+            top = cy - font.metrics("ascent") * 0.6
+        if para is not None:  # hide the old text while typing over it
+            x0, y0, x1, y1 = self.canvas_rect(para["box"])
+            self.canvas.create_rectangle(x0 - 3, y0 - 1, x1 + 3, y1 + 1, fill="#ffffff", outline="", tags="pecover")
+        t = tk.Text(self.canvas, font=font, wrap="word", bd=0, padx=0, pady=0, highlightthickness=1,
+                    highlightbackground=UI["accent"], highlightcolor=UI["accent"], bg="#ffffff", fg=fill,
+                    insertbackground=fill, undo=True)
+        t.insert("1.0", text)
+        win = self.canvas.create_window(x - 1, top - 1, window=t, anchor="nw", width=max(40, width * self.s + 4),
+                                        height=font.metrics("linespace") + 4)
+        self.para_edit = dict(para=para, text=t, win=win, size=size, start_size=size, font=font, lead=lead,
+                              xy=self.from_canvas(x, top + font.metrics("ascent")) if para is None else None)
+        t.bind("<Escape>", lambda e: (self.commit_para_edit(cancel=True), "break")[1])
+        t.bind("<Control-Return>", lambda e: (self.commit_para_edit(), "break")[1])
+        t.bind("<Command-Return>" if sys.platform == "darwin" else "<Alt-Return>",
+               lambda e: (self.commit_para_edit(), "break")[1])
+        t.bind("<KeyRelease>", lambda e: self.fit_para_box())
+        self.fit_para_box()
+        t.focus_set()
+        t.update_idletasks()
+        t.mark_set("insert", f"@{int(cx - x)},{int(cy - top)}" if para is not None else "end")
+
+    def fit_para_box(self):
+        pe = self.para_edit
+        if pe is None:
+            return
+        t, font = pe["text"], pe["font"]
+        line_px = pe["lead"] * pe["size"] / pe["start_size"] * self.s
+        extra = max(0, round(line_px - font.metrics("linespace")))
+        t.configure(spacing2=extra, spacing3=extra)
+        t.update_idletasks()
+        try:
+            n = t.count("1.0", "end", "displaylines")
+            n = n[0] if isinstance(n, tuple) else n
+        except tk.TclError:
+            n = None
+        n = max(1, n or int(t.index("end-1c").split(".")[0]))
+        self.canvas.itemconfig(pe["win"], height=round(n * (font.metrics("linespace") + extra)) + 6)
+
+    def commit_para_edit(self, cancel=False):
+        pe, self.para_edit = self.para_edit, None
+        if pe is None:
+            return
+        new = pe["text"].get("1.0", "end-1c").strip()
+        try:
+            self.canvas.delete(pe["win"])
+            self.canvas.delete("pecover")
+            pe["text"].destroy()
+        except tk.TclError:
+            pass
+        self.hint.config(text="")
+        if cancel:
+            return
+        para, size = pe["para"], pe["size"]
+        if para is None:
+            if new:
+                x, y = pe["xy"]
+                self.apply_edit(lambda pdf, page: add_text(pdf, page, x, y + size * 0.8, new, size=size), "Added text.")
+            return
+        sized = abs(size - pe["start_size"]) > 0.05
+        if " ".join(new.split()) == " ".join(para["text"].split()) and not sized:
+            return
+        note = self.apply_edit(lambda pdf, page: edit_paragraph(pdf, page, para, new, size=size if sized else None),
+                               "Edited text." if new else "Deleted text.")
+        if note:
+            self.hint.config(text=note)
+            self.app._status(note)
+
+    def edit_delete(self):
+        pe = self.para_edit
+        if pe is not None and pe["para"] is not None:
+            pe["text"].delete("1.0", "end")
+            self.commit_para_edit()
+        elif pe is not None:
+            self.commit_para_edit(cancel=True)
+        elif self.esel is not None:
+            img = self.page_layout()[1][self.esel]
+            self.esel = None
+            self.apply_edit(lambda pdf, page: edit_image(pdf, page, img, delete=True), "Removed a picture.")
+        else:
+            self.hint.config(text="Click a picture to select it, or into text, first.")
+
+    def _ask_picture(self, title):
+        path = filedialog.askopenfilename(parent=self.win, title=title, filetypes=[
+            ("Pictures", " ".join("*" + e for e in sorted(IMAGE_EXTS))), ("All files", "*.*")])
+        if not path:
+            return None
+        try:
+            im = Image.open(path)
+            im = ImageOps.exif_transpose(im)
+            im.load()
+            return im
+        except Exception as e:
+            messagebox.showerror("Edit PDF", f"That picture couldn't be opened.\n\n{explain_error(e)}", parent=self.win)
+            return None
+
+    def pick_new_image(self):
+        self.commit_para_edit()
+        im = self._ask_picture("Add a picture")
+        if im is not None:
+            self.new_image = im
+            self.set_tool("addimage")
+
+    def replace_image(self):
+        self.commit_para_edit()
+        if self.esel is None:
+            self.hint.config(text="Click the picture to replace first.")
+            return
+        img = self.page_layout()[1][self.esel]
+        im = self._ask_picture("Replace the picture with")
+        if im is not None:
+            self.apply_edit(lambda pdf, page: edit_image(pdf, page, img, replace_with=im), "Replaced a picture.")
+
+    def edit_undo(self):
+        self.commit_para_edit(cancel=True)
+        if not self.app.undo_stack:
+            return
+        self.app.undo()
+        self.esel = None
+        self.k = min(self.k, len(self.app.pages) - 1)
+        self.show()
 
     # ---- certificate signature ------------------------------------------------ #
     def place_certificate(self, rect):
@@ -4541,8 +5831,8 @@ def reveal_file(path):
 
 def self_test():
     """Used by the release build: exit code 0 if the packaged app can turn an
-    image into a PDF, merge, compress, stamp, password-protect and render, and
-    load drag and drop."""
+    image into a PDF, merge, compress, stamp, password-protect and render, fill,
+    comment and sign, edit a page's own text and pictures, and load drag and drop."""
     try:
         if load_libraries():
             return 1
@@ -4593,6 +5883,26 @@ def self_test():
         sigs = check_signatures(open(signed, "rb").read())
         if not (len(sigs) == 1 and sigs[0]["intact"] and sigs[0]["name"] == "Self Test"):
             return 5
+        # Edit PDF: change a paragraph's text in place, move a picture, and embed
+        # an installed font (fontTools).
+        pdf = pikepdf.open(io.BytesIO(blank_pdf(612, 792)))
+        page = pdf.pages[0]
+        add_text(pdf, page, 72, 720, "Original words here", size=14)
+        add_image(pdf, page, Image.new("RGB", (40, 30), (200, 30, 30)), (72, 500, 152, 560))
+        _, glyphs, images, _ = read_page_content(pdf, page)
+        edit_paragraph(pdf, page, text_blocks(glyphs)[0], "Replaced words")
+        _, _, images, _ = read_page_content(pdf, page)
+        edit_image(pdf, page, images[0], new_box=(300, 400, 380, 460))
+        if find_system_font("ArialMT") and embed_system_font(pdf, "ArialMT", "Hello") is None:
+            return 7
+        buf = io.BytesIO()
+        pdf.save(buf)
+        text = pdfium.PdfDocument(buf.getvalue())[0].get_textpage().get_text_range()
+        check = pikepdf.open(io.BytesIO(buf.getvalue()))
+        _, _, images, _ = read_page_content(check, check.pages[0])
+        if "Replaced words" not in text or "Original" in text or \
+                [round(v) for v in image_box(images[0]["ctm"])] != [300, 400, 380, 460]:
+            return 6
         root = tk.Tk()
         root.withdraw()
         from tkinterdnd2 import TkinterDnD

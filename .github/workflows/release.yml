@@ -30,14 +30,15 @@ jobs:
         with:
           python-version: "3.12"
       # Pinned to the versions the Windows build was tested with.
-      - run: python -m pip install pyinstaller==6.22.3 pikepdf==10.18.2 pypdfium2==5.15.2 pillow==13.0.0 pillow-heif==1.8.1 pyhanko==0.38.1 tkinterdnd2==0.7.0
+      - run: python -m pip install pyinstaller==6.22.3 pikepdf==10.18.2 pypdfium2==5.15.2 pillow==13.0.0 pillow-heif==1.8.1 pyhanko==0.38.1 fonttools==4.68.0 tkinterdnd2==0.7.0
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         # One file, no console window. PyInstaller has hooks for pikepdf (qpdf) and pypdfium2 (PDFium);
-        # tkinterdnd2 ships its own, which bundles its native drag-and-drop library.
+        # tkinterdnd2 ships its own, which bundles its native drag-and-drop library. fontTools loads
+        # its font-table modules by name, so all of them are collected.
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name PDF-Toolkit pdf_toolkit.py
+          pyinstaller --noconfirm --onefile --windowed --collect-submodules fontTools --name PDF-Toolkit pdf_toolkit.py
           Move-Item dist/PDF-Toolkit.exe ${{ matrix.asset }}
 
       - name: Build (macOS)
@@ -45,7 +46,7 @@ jobs:
         # A .app bundle (one-dir: macOS apps are folders). ditto keeps the
         # permissions and code signature that a plain zip would lose.
         run: |
-          pyinstaller --noconfirm --windowed --name "PDF Toolkit" pdf_toolkit.py
+          pyinstaller --noconfirm --windowed --collect-submodules fontTools --name "PDF Toolkit" pdf_toolkit.py
           ditto -c -k --keepParent "dist/PDF Toolkit.app" ${{ matrix.asset }}
 
       # Smoke test: the app must start and still be running after 20 s
@@ -57,7 +58,7 @@ jobs:
           Start-Sleep 20
           if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id -Force
-          # Makes, merges, compresses, stamps, encrypts, comments on, certificate-signs and renders a PDF, and loads drag and drop, inside the packaged app.
+          # Makes, merges, compresses, stamps, encrypts, comments on, certificate-signs, edits the text and pictures of, and renders a PDF, and loads drag and drop, inside the packaged app.
           $t = Start-Process ./${{ matrix.asset }} -ArgumentList "--self-test" -PassThru -Wait
           if ($t.ExitCode -ne 0) { throw "Self-test failed with code $($t.ExitCode)" }
       - name: Smoke test (macOS)
@@ -68,7 +69,7 @@ jobs:
           sleep 20
           kill -0 $pid || { echo "App exited early"; exit 1; }
           kill $pid
-          # Makes, merges, compresses, stamps, encrypts, comments on, certificate-signs and renders a PDF, and loads drag and drop, inside the packaged app.
+          # Makes, merges, compresses, stamps, encrypts, comments on, certificate-signs, edits the text and pictures of, and renders a PDF, and loads drag and drop, inside the packaged app.
           "dist/PDF Toolkit.app/Contents/MacOS/PDF Toolkit" --self-test || { echo "Self-test failed with code $?"; exit 1; }
 
       - uses: actions/upload-artifact@v4
