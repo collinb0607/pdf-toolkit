@@ -2486,6 +2486,7 @@ class ToolkitApp:
         self.progress = ttk.Progressbar(status, mode="determinate", maximum=1000, length=160,
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.pack(side="right", pady=8)
+        support_link(status, bg=UI["statusbar"], font=(_FAMILY, 9, "underline")).pack(side="right", padx=(0, 16))
 
         grid = tk.Frame(main, bg=UI["canvas"])
         grid.pack(fill="both", expand=True)
@@ -5912,6 +5913,19 @@ def self_test():
     except Exception as e:
         log_error(f"Self-test failed: {type(e).__name__}: {e}")
         return 3
+
+
+SUPPORT_URL = "https://ko-fi.com/collinbrooksdev"
+
+
+def support_link(parent, bg=None, font=None):
+    """A small "Support this project" link that opens the Ko-fi page in the browser."""
+    import webbrowser
+    kw = {"bg": bg} if bg else {}
+    link = tk.Label(parent, text="\u2665 Support this project", fg="#c8364f", cursor="hand2",
+                    font=font or ("", 9, "underline"), **kw)
+    link.bind("<Button-1>", lambda e: webbrowser.open(SUPPORT_URL))
+    return link
 
 
 def main():
