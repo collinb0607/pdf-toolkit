@@ -3506,7 +3506,9 @@ class ToolkitApp:
         # Document properties: the ones set in the app, else the original's title (one file only).
         first = opened.get(pages[0]["doc"])
         if first is not None and "/Title" in first.docinfo and len({p["doc"] for p in pages}) == 1:
-            out.docinfo["/Title"] = first.docinfo["/Title"]
+            # As text: some files keep the title as an object of its own, which can't be put
+            # into another PDF as it is.
+            out.docinfo["/Title"] = pikepdf.String(str(first.docinfo["/Title"]))
         for k, v in (o.get("info") or {}).items():
             if v:
                 out.docinfo[k] = v
