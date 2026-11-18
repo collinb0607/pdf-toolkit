@@ -2302,12 +2302,9 @@ class ToolkitApp:
         bar = tk.Frame(root, bg=UI["appbar"], height=48)
         bar.pack(fill="x")
         bar.pack_propagate(False)
-        mark = tk.Canvas(bar, width=26, height=30, bg=UI["appbar"], highlightthickness=0)
-        mark.create_polygon(3, 2, 17, 2, 24, 9, 24, 28, 3, 28, fill="#ffffff", outline="")
-        mark.create_polygon(17, 2, 17, 9, 24, 9, fill="#cfc6ff", outline="")
-        for i, yy in enumerate((14, 18, 22)):
-            mark.create_line(7, yy, 20 if i < 2 else 15, yy, fill=UI["accent"], width=2)
-        mark.pack(side="left", padx=(14, 8))
+        self._logo = tk.PhotoImage(master=root, data=HEADER_ICON)  # the app's own icon
+        mark = tk.Label(bar, image=self._logo, bg=UI["appbar"], bd=0)
+        mark.pack(side="left", padx=(12, 8))
         tk.Label(bar, text="PDF Toolkit", bg=UI["appbar"], fg="#ffffff", font=UI["title"]).pack(side="left", padx=(0, 14))
         self.mode_btns = []
         for label, cmd, tip in (("Organize", None, "Arrange, rotate, crop and combine pages"),
@@ -5990,6 +5987,35 @@ APP_ICON = (
     "ZKgXvr8yvNNhTOzS5KPkD4ZPrTFsN0HoEiI9E6B26dPW5ENH5vKUNBPyn9l655P/2ax3TsrhceGeBGLqKpu3iNsvQ3jf/rtW"
     "vVFM7ThZHyWjo6eh7Zvn0lEOQzUnuxHLvTQcbgUfOvR072u3/DKSzO/i0THo5M92KXp8LF1c/g+RoejetO5mIwAAAABJRU5E"
     "rkJggg=="
+)
+
+# The same icon, small, for the app's header bar.
+HEADER_ICON = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGuklEQVR42rWXX2xcRxXGf+fMvbvrtdfGOI3zp9ikadSEVBCp"
+    "kaqikKhVhVyqJBQQqsQDSBWCgoRahBB/ZRsEPERCBR6qkvJAKwTiIVJLVNoCUVSRiocoKiqQULdpalrbMW3+OLaz3r13Dg9z"
+    "7927cUoKgpGuZnZ2955vvu98Z2ag1MxMxsfHlf9TMzMxMynPRflgfHxcRcQD9rNHntpVr1b3Jkm6LUmSHkTMTATt/FcQEACF"
+    "Yhy+QUHEmYFELm7GlfjkYrN1WESey2NNTk767Nedia9/6eDw1u3veXhhoXnPzOvn+ef8BZLUI6IgEh7C05krfVf+jGJAFEes"
+    "WTvIho399PVVfvO3l2c/f2DyozN5zBLlm9eMrrvu6Omp+W3PHT2Rrqwk5iIn+QslDy76NsEVK88joIoheBOr1mLZvfv97r2j"
+    "/VOvTJ/b871vjs1NTEyImJmKiP/pj5984rVXz+/77eFjrUZ/b0UjV7xENQ969cCdXvHGKiZQwXu4tNRq3TW2s7Jxfe2Z++/7"
+    "4JiZBVEf/cmTt11aTJ7/9S+PJM5FkTrtrFSVVivBuHrAfCwimAg99R4QCb9HAisZcx5IjeSTH7s1Mr9y+4P3f+hoBCBR9Inp"
+    "187a0nKLRn9M4kGdIAaxU777g08xONTAzEp5QJF85g0XOU4cn+Pgz4/QU6+BCN4yEAjeQFRZWm4x/cYl27ql8XEgAEgSv3Vm"
+    "9pwYIklqWQzDEByenbfeyMBA3zVtdsOGUZrLVR479DTVag8mglkGAMADojI7vyBbNvVtLWyYpr7SaiV4g9QbIoIXACPxsLS4"
+    "QqNRx8yyZCw3ISfmzXPGHbftQFQ4+KtnqPbUEAFvBElUSE1YaRuJp1oA8IChpB5SH2hVAQM0BVFBVd8GAAWAel1YvuTZP/YB"
+    "oio8/Is/EMdVzMAj4IXUFMNhopZXEUDxJngUH2xDagFMateucDmm9SNw805hw2bj3ntvot5ToZUYKZq9W/Hi8BJAFAxYlqWG"
+    "wwjeFeuA+U+biNBcaZEaeFxWlBRRh0mKaVSgjoolqAuFQ1xhOTMJ1P0XLdjS4cWFwAiIC9qKC/EKAKphUqIwDsUcI3jbSiC8"
+    "zxyu0jU2syIXiuTMA4kLNUMdOAN3JQNkDDgHGhWFI99Yyk1LG1I+zpNzVX5qFB4XZMAppL4DqkjCMlKNMiZKfWc75e8vznL6"
+    "1DwAJ194g5denEVEmJ9Z4MTzZ1hcaBbOCLK67sVpJeu1LAGd4IUECtbNwJtnF3n8R3+kt7/K0No+ZqcvUO2J2LJ9HTPT52m3"
+    "UkZuGKKvv9bNQLE4JeRkJknZhqiW9HLd6LMcEBHa7ZTGQI3eRo3tt1zPVw/s5cSxM7TbHgwq1ajjTY3AxUFzdZ1eo6KeZC7Q"
+    "UsCo2AWx8kEjSFCpOj79wG4uvLXEQ99+mtOn5tlz9zam/jrHrg/fRN9ArVMbyouQfJEgmeOuYsPSilUR8uNAQDE4VOfL3/8I"
+    "jYEatXrMF751J1HsGL1xDbfs2sTAu+v5ezNiS7JKqANSSLDKhiUWikOFglrBQlyJGFwTYQZx7Ni8bTgw442htX0lR5SdFQCI"
+    "aEhEbx2WV9lQQ9EAKXrUuiTIc6GoCdKpA6v2CY2yVbtwLsgkwHWSsEsCKXu2YMBTToRykHJN6MyX5pwDi7oZdqy2oeSZ77Jq"
+    "2CWB4r3hvZXo/XdHb4otuGPDDIBzYHQqZAFApR1V4k7ByCWxIEFfbyVb7TvfF/rqcXcRKiQQ4kqMqLYKAM7Fp4aHB8f+fHLW"
+    "RKPs8KAIiqnnTy+8ztC7atnqhC4arqDeMjkuLiZhI3JxsQGJc6SJ2fCaXoPkpQJAs+kPjVzfeLBWr4jP7GJZIiYGX/zOsZCA"
+    "OZWS20o7Kyv64CKJKvT0DiBRSEDRcA6o1YSR4YostNqHAGTcTCdF/A8fPf7UmVm764ln/9Lqb/RUtJS5mutYAHDFibkrcBmg"
+    "hvNEDtTjWGhaa9/u0crIYPPIV+4ZunPcTJSJCcxMpueW7tsy2ju1f2xHxaPp4opPmm3SZlvS5Zalyyvhubxi6eWWhbmWpctt"
+    "S5dbZL2ly22Kp5lo2kw0XWxp4kXTfXs2VTYP26uvzPAZM4MJiLI7mj40OTn7uW/8/vabt488sn7djrun51Y4+9ZlEs9qquUa"
+    "n7PeRImjiOGhOiPXOWpx+uzxqYufffyBjf9YO286OSleypfT/MJ44LGX7+ivR3vbafI+761WnFLRzr1A8n1MOjeg/DtVTARB"
+    "UBc3XRyfung5Ofy1/Y3fhVgh+Du6Pv+vr+dXXv//BW6Wszmmrys3AAAAAElFTkSuQmCC"
 )
 
 
