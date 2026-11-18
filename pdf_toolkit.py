@@ -73,14 +73,18 @@ IMAGE_DPI = 150  # page size for images without (sensible) DPI information
 RENDER_PX = 300
 PAD = 16
 
-# Look and feel: a dark app bar, a light tools panel, pages on a grey desk.
+# Look and feel (the Offline Toolkit's colours): a dark purple app bar, a light tools panel,
+# pages on a soft lavender desk, blue actions.
 _FAMILY = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans"
 UI = dict(
     family=_FAMILY, font=(_FAMILY, 10), small=(_FAMILY, 9), tiny=(_FAMILY, 8), bold=(_FAMILY, 10, "bold"),
     heading=(_FAMILY, 13, "bold"), title=(_FAMILY, 12, "bold"), icon=(_FAMILY, 14),
-    appbar="#2b2b2b", toolbar="#ffffff", panel="#ffffff", canvas="#e4e6ea", statusbar="#f6f7f9",
-    border="#d9dce1", hover="#eceef2", text="#1f2328", muted="#68707d", disabled="#b4b9c2",
-    accent="#1473e6", accent_dark="#0d5fc4", sel_bg="#dbe9fd", error="#b42318",
+    appbar="#2b1655", toolbar="#ffffff", panel="#ffffff", canvas="#ebe7f5", statusbar="#f7f5fc",
+    border="#e2ddf0", hover="#f1ecfb", text="#1c1433", muted="#6e6787", disabled="#c9c4d8",
+    accent="#2f7cf6", accent_dark="#1d67dc", sel_bg="#e7f0ff", error="#c8364f",
+    # On the app bar: the open tab, a hovered button, separators, the search box, its text.
+    bar_tab="#4a2a8a", bar_hover="#3d2470", bar_sep="#4d3a7a", bar_field="#3a2468",
+    bar_text="#ddd5f5", bar_dim="#c4b8ea", bar_label="#d6ccf5",
 )
 
 # Helvetica character widths (1/1000 em) for ASCII 32-126, for centring stamps.
@@ -2161,7 +2165,7 @@ class Tooltip:
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.geometry(f"+{x}+{y}")
-        tk.Label(self.tip, text=self.text, bg="#2c2c2c", fg="#ffffff", font=UI["small"], padx=8, pady=4).pack()
+        tk.Label(self.tip, text=self.text, bg=UI["appbar"], fg="#ffffff", font=UI["small"], padx=8, pady=4).pack()
 
     def _hide(self, event=None):
         if self.job:
@@ -2300,7 +2304,7 @@ class ToolkitApp:
         bar.pack_propagate(False)
         mark = tk.Canvas(bar, width=26, height=30, bg=UI["appbar"], highlightthickness=0)
         mark.create_polygon(3, 2, 17, 2, 24, 9, 24, 28, 3, 28, fill="#ffffff", outline="")
-        mark.create_polygon(17, 2, 17, 9, 24, 9, fill="#c9d6ea", outline="")
+        mark.create_polygon(17, 2, 17, 9, 24, 9, fill="#cfc6ff", outline="")
         for i, yy in enumerate((14, 18, 22)):
             mark.create_line(7, yy, 20 if i < 2 else 15, yy, fill=UI["accent"], width=2)
         mark.pack(side="left", padx=(14, 8))
@@ -2313,21 +2317,21 @@ class ToolkitApp:
                                 ("Fill & Sign", lambda: self.open_editor("fill"), "Fill in forms and sign"),
                                 ("Prepare form", lambda: self.open_editor("form"), "Add fillable fields"),
                                 ("Compare", lambda: CompareWindow(self), "Compare two PDFs")):
-            b = FlatButton(bar, label, cmd or (lambda: None), UI["appbar"], fg="#d8d8d8", hover="#4a4a4a",
+            b = FlatButton(bar, label, cmd or (lambda: None), UI["appbar"], fg=UI["bar_text"], hover=UI["bar_hover"],
                            font=UI["bold"], padx=10, pady=12, tip=tip)
             b.pack(side="left")
             if cmd is None:
-                b.colors.update(bg="#3d4f6b", fg="#ffffff")
-                b.config(bg="#3d4f6b", fg="#ffffff", cursor="")
+                b.colors.update(bg=UI["bar_tab"], fg="#ffffff")
+                b.config(bg=UI["bar_tab"], fg="#ffffff", cursor="")
             else:
                 self.mode_btns.append(b)
         self.save_btn = FlatButton(bar, "  Save as PDF  ", self.save_all, UI["appbar"], primary=True,
                                    font=UI["bold"], pady=6, tip="Save every page in the workspace as one PDF (Ctrl+S)")
         self.save_btn.pack(side="right", padx=14, pady=8)
         self.open_btn = FlatButton(bar, "＋  Add files", self.add_files, UI["appbar"], fg="#ffffff",
-                                   hover="#4a4a4a", pady=6, tip="Add PDFs or images (or drag them in)")
+                                   hover=UI["bar_hover"], pady=6, tip="Add PDFs or images (or drag them in)")
         self.open_btn.pack(side="right", pady=8)
-        self.print_btn = FlatButton(bar, "🖨  Print", self.print_pdf, UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+        self.print_btn = FlatButton(bar, "🖨  Print", self.print_pdf, UI["appbar"], fg="#ffffff", hover=UI["bar_hover"],
                                     pady=6, tip="Opens the finished PDF in your PDF reader to print")
         self.print_btn.pack(side="right", pady=8)
 
@@ -2497,7 +2501,7 @@ class ToolkitApp:
         sb.pack(side="right", fill="y")
         self.empty = tk.Frame(self.canvas, bg=UI["canvas"])
         drop = tk.Canvas(self.empty, width=380, height=200, bg=UI["canvas"], highlightthickness=0)
-        drop.create_rectangle(4, 4, 376, 196, outline="#a9b1bd", dash=(6, 4), width=2)
+        drop.create_rectangle(4, 4, 376, 196, outline="#a99fd0", dash=(6, 4), width=2)
         drop.create_text(190, 70, text="⇪", font=(UI["family"], 30), fill=UI["accent"])
         self.empty_text = drop.create_text(190, 125, text="", font=UI["heading"], fill=UI["text"])
         drop.create_text(190, 156, text="PDFs and images (JPG, PNG, HEIC, WebP, TIFF)", font=UI["small"],
@@ -2733,12 +2737,12 @@ class ToolkitApp:
             return False
         pw, ph = photo.width(), photo.height()
         # A soft drop shadow under the page, like paper on a desk.
-        for off, col in ((4, "#c9ccd1"), (2, "#b7bbc2")):
+        for off, col in ((4, "#d3cce6"), (2, "#bfb6da")):
             it["extra"].append(c.create_rectangle(cx - pw / 2 + off, cy - ph / 2 + off, cx + pw / 2 + off,
                                                   cy + ph / 2 + off, fill=col, outline=""))
         it["img"] = c.create_image(cx, cy, image=photo)
         it["extra"].append(c.create_rectangle(cx - pw / 2, cy - ph / 2, cx + pw / 2, cy + ph / 2,
-                                              outline="#9aa1ab"))
+                                              outline="#9d93bf"))
         if self._has_fill(page):  # a badge on pages that were filled in or signed
             bx, by = cx + pw / 2 - 4, cy - ph / 2 + 4
             it["extra"].append(c.create_oval(bx - 12, by - 12, bx + 12, by + 12, fill=UI["accent"], outline="#ffffff",
@@ -4207,40 +4211,40 @@ class PageEditor:
         bar.pack_propagate(False)
         self.tabs = {}
         for key, label in self.MODES:
-            b = FlatButton(bar, label, lambda k=key: self.set_mode(k), UI["appbar"], fg="#d8d8d8", hover="#4a4a4a",
+            b = FlatButton(bar, label, lambda k=key: self.set_mode(k), UI["appbar"], fg=UI["bar_text"], hover=UI["bar_hover"],
                            font=UI["bold"], padx=12, pady=12)
             b.pack(side="left", padx=(10 if key == "view" else 0, 0))
             self.tabs[key] = b
         FlatButton(bar, "  Done  ", self.done, UI["appbar"], primary=True, font=UI["bold"], pady=6).pack(
             side="right", padx=(8, 14), pady=8)
-        self.page_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["font"])
+        self.page_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg=UI["bar_label"], font=UI["font"])
         nav = [("▶", lambda: self.go(1), "Next page (Page Down)"), (None, None, None),
                ("◀", lambda: self.go(-1), "Previous page (Page Up)")]
         for icon, fn, tip in nav:
             if icon is None:
                 self.page_lbl.pack(side="right", padx=2)
                 continue
-            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip=tip).pack(side="right")
-        tk.Frame(bar, bg="#555555", width=1).pack(side="right", fill="y", padx=8, pady=12)
+            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover=UI["bar_hover"], tip=tip).pack(side="right")
+        tk.Frame(bar, bg=UI["bar_sep"], width=1).pack(side="right", fill="y", padx=8, pady=12)
         for icon, fn, tip in (("＋", lambda: self.set_zoom(1.25), "Zoom in"), ("Fit", lambda: self.set_zoom(None), "Fit page"),
                               ("－", lambda: self.set_zoom(0.8), "Zoom out")):
-            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover="#4a4a4a", tip=tip, padx=7).pack(side="right")
-        self.zoom_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["small"], width=5)
+            FlatButton(bar, icon, fn, UI["appbar"], fg="#ffffff", hover=UI["bar_hover"], tip=tip, padx=7).pack(side="right")
+        self.zoom_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg=UI["bar_label"], font=UI["small"], width=5)
         self.zoom_lbl.pack(side="right")
-        tk.Frame(bar, bg="#555555", width=1).pack(side="right", fill="y", padx=8, pady=12)
-        self.count_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg="#d0d0d0", font=UI["small"])
+        tk.Frame(bar, bg=UI["bar_sep"], width=1).pack(side="right", fill="y", padx=8, pady=12)
+        self.count_lbl = tk.Label(bar, text="", bg=UI["appbar"], fg=UI["bar_label"], font=UI["small"])
         self.count_lbl.pack(side="right", padx=(4, 0))
-        FlatButton(bar, "▼", lambda: self.next_match(1), UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+        FlatButton(bar, "▼", lambda: self.next_match(1), UI["appbar"], fg="#ffffff", hover=UI["bar_hover"],
                    tip="Next match (Enter)", padx=5).pack(side="right")
-        FlatButton(bar, "▲", lambda: self.next_match(-1), UI["appbar"], fg="#ffffff", hover="#4a4a4a",
+        FlatButton(bar, "▲", lambda: self.next_match(-1), UI["appbar"], fg="#ffffff", hover=UI["bar_hover"],
                    tip="Previous match (Shift+Enter)", padx=5).pack(side="right")
         self.query = tk.StringVar()
         self.search_e = tk.Entry(bar, textvariable=self.query, width=20, relief="flat", font=UI["font"],
-                                 bg="#3d3d3d", fg="#ffffff", insertbackground="#ffffff")
+                                 bg=UI["bar_field"], fg="#ffffff", insertbackground="#ffffff")
         self.search_e.pack(side="right", ipady=4, pady=11)
         self.search_e.bind("<Return>", lambda e: self.search())
         self.search_e.bind("<Shift-Return>", lambda e: self.next_match(-1))
-        tk.Label(bar, text="🔍", bg=UI["appbar"], fg="#d0d0d0", font=UI["font"]).pack(side="right", padx=(0, 4))
+        tk.Label(bar, text="🔍", bg=UI["appbar"], fg=UI["bar_label"], font=UI["font"]).pack(side="right", padx=(0, 4))
 
         self.tools = tk.Frame(w, bg=UI["toolbar"], height=46, highlightthickness=1, highlightbackground=UI["border"])
         self.tools.pack(fill="x")
@@ -4286,8 +4290,8 @@ class PageEditor:
         self.select(None)
         for k, b in self.tabs.items():
             on = k == mode
-            b.colors["fg"] = "#ffffff" if on else "#b8b8b8"
-            b.colors["bg"] = "#3d4f6b" if on else UI["appbar"]
+            b.colors["fg"] = "#ffffff" if on else UI["bar_dim"]
+            b.colors["bg"] = UI["bar_tab"] if on else UI["appbar"]
             b.config(fg=b.colors["fg"], bg=b.colors["bg"])
         for child in self.tools.winfo_children():
             child.destroy()
@@ -4462,7 +4466,7 @@ class PageEditor:
                                 fill=tuple(int(v * 255) for v in m["color"]))
             im = ImageChops.multiply(im.convert("RGB"), layer)
         self.photo = ImageTk.PhotoImage(im)
-        c.create_rectangle(self.ox + 3, self.oy + 3, self.ox + im.width + 3, self.oy + im.height + 3, fill="#b9bdc4", outline="")
+        c.create_rectangle(self.ox + 3, self.oy + 3, self.ox + im.width + 3, self.oy + im.height + 3, fill="#c4bcdb", outline="")
         c.create_image(self.ox, self.oy, image=self.photo, anchor="nw")
         self.page_lbl.config(text=f"Page {self.k + 1} of {len(self.app.pages)}")
         self.zoom_lbl.config(text=f"{self.s * 72 / 96 * 100:.0f}%")  # 100% = actual size on a 96 DPI screen
@@ -5761,7 +5765,7 @@ class CompareWindow:
             self.photos.append(photo)
             ox, oy = x + (half - shown.width) / 2, 28
             c.create_image(ox, oy, image=photo, anchor="nw")
-            c.create_rectangle(ox, oy, ox + shown.width, oy + shown.height, outline="#9aa1ab")
+            c.create_rectangle(ox, oy, ox + shown.width, oy + shown.height, outline="#9d93bf")
             sx, sy = (1, 1) if key == "a" else r.get("scale_b", (1, 1))
             for x0, y0, x1, y1 in r["boxes"]:
                 c.create_rectangle(ox + x0 * sx * s, oy + y0 * sy * s, ox + x1 * sx * s, oy + y1 * sy * s,
