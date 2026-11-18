@@ -5934,10 +5934,82 @@ def support_link(parent, bg=None, font=None):
     return link
 
 
+# The app's icon (64 px PNG), for the window and the taskbar. The .exe and the Mac app get
+# theirs from assets/ when they're built.
+APP_ICON = (
+    "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"
+    "rkJggg=="
+)
+
+
+def set_app_icon(root):
+    try:
+        if sys.platform == "win32":
+            # Its own taskbar button and icon, not Python's, when run as a script.
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OfflineToolkit.PDFToolkit")
+        root._app_icon = tk.PhotoImage(master=root, data=APP_ICON)
+        root.iconphoto(True, root._app_icon)
+    except Exception:
+        pass  # just the default icon
+
+
 def main():
     if "--self-test" in sys.argv:
         sys.exit(self_test())
     root = tk.Tk()
+    set_app_icon(root)
     try:  # nicer native look where available
         ttk.Style().theme_use("vista" if sys.platform == "win32" else
                               "aqua" if sys.platform == "darwin" else "clam")

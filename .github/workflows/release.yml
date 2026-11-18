@@ -38,7 +38,7 @@ jobs:
         # tkinterdnd2 ships its own, which bundles its native drag-and-drop library. fontTools loads
         # its font-table modules by name, so all of them are collected.
         run: |
-          pyinstaller --noconfirm --onefile --windowed --collect-submodules fontTools --name PDF-Toolkit pdf_toolkit.py
+          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --collect-submodules fontTools --name PDF-Toolkit pdf_toolkit.py
           Move-Item dist/PDF-Toolkit.exe ${{ matrix.asset }}
 
       - name: Build (macOS)
@@ -46,7 +46,7 @@ jobs:
         # A .app bundle (one-dir: macOS apps are folders). ditto keeps the
         # permissions and code signature that a plain zip would lose.
         run: |
-          pyinstaller --noconfirm --windowed --collect-submodules fontTools --name "PDF Toolkit" pdf_toolkit.py
+          pyinstaller --noconfirm --icon assets/icon.icns --windowed --collect-submodules fontTools --name "PDF Toolkit" pdf_toolkit.py
           ditto -c -k --keepParent "dist/PDF Toolkit.app" ${{ matrix.asset }}
 
       # Smoke test: the app must start and still be running after 20 s
