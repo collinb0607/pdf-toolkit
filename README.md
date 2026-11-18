@@ -52,7 +52,7 @@ Double-clicking a page in the grid opens it here.
   **A−**/**A+** change the size; deleting all the words removes the text.
 - The new words use the **PDF's own font** when it already has every letter needed. If not, the
   **same font from your computer** is used (only the letters needed are embedded, and only if the
-  font's licence allows it), and otherwise the closest standard font (Helvetica, Times or Courier).
+  font's license allows it), and otherwise the closest standard font (Helvetica, Times or Courier).
 - The old text is really gone (search and copy find the new words), and everything else on the page
   stays exactly where it was. If the new text is longer than the old, the editor says so: it runs
   below the original space rather than pushing the rest of the page down.
@@ -65,7 +65,7 @@ Double-clicking a page in the grid opens it here.
 
 **Comment**: **highlight**, **underline** or **strike through** text (drag across it), add **sticky
 notes**, **text boxes**, **rectangles**, **ellipses**, **arrows** and **freehand drawing**, in five
-colours. Click a comment to select it, drag to move it, A−/A+ to resize, Delete to remove;
+colors. Click a comment to select it, drag to move it, A−/A+ to resize, Delete to remove;
 double-click a note or text box to edit it. They're saved as standard PDF comments, so Acrobat,
 Preview and web browsers show them, and can reply to or change them (or flatten them into the page).
 
@@ -120,13 +120,13 @@ at the end are listed too.
 | Tool | What it does |
 |---|---|
 | Compress | Re-compresses the photos and scans inside the PDF. **Light** keeps them full size (JPEG quality 85), **Balanced** shrinks them to 2000 pixels (quality 70), **Strong** to 1200 pixels (quality 50). Text and drawings are never touched, and an image is only replaced if the new one is smaller. A 9.4 MB scanned PDF became 4.5 MB, 1.1 MB or 0.3 MB. |
-| Page numbers | "1", "Page 1", "Page 1 of 9" or "1 / 9", bottom centre, bottom right or top right. Placed upright on every page, even rotated ones. |
+| Page numbers | "1", "Page 1", "Page 1 of 9" or "1 / 9", bottom center, bottom right or top right. Placed upright on every page, even rotated ones. |
 | Watermark | Your text, large, faint and diagonal across every page (e.g. DRAFT, CONFIDENTIAL). |
-| Header & footer | Your own text at the top and bottom of every page, left, centred or right. `{page}`, `{pages}`, `{date}`, `{file}` and `{bates}` are filled in, e.g. `{file} — page {page} of {pages}`. |
+| Header & footer | Your own text at the top and bottom of every page, left, centered or right. `{page}`, `{pages}`, `{date}`, `{file}` and `{bates}` are filled in, e.g. `{file} — page {page} of {pages}`. |
 | Bates numbers | `{bates}` becomes a prefix and running number, e.g. ACME-000041, ACME-000042… (six digits). When splitting, the numbers continue from file to file. |
 | Forms & signatures | **Flatten when saving**: always make filled-in fields, signatures and comments part of the page. |
 | Protect | A password needed to open the saved file (AES-256). Leave it off to save without one: that's how you **remove** a password from a PDF you opened. |
-| Images to PDF | Each added image becomes a page: the image's own size, or centred on A4 or Letter paper. JPEG photos go in unchanged (no quality loss); other images are stored losslessly, transparency included. |
+| Images to PDF | Each added image becomes a page: the image's own size, or centered on A4 or Letter paper. JPEG photos go in unchanged (no quality loss); other images are stored losslessly, transparency included. |
 
 Fillable form fields keep working after you rearrange pages. **Bookmarks** (the outline in a PDF
 reader's sidebar) are kept, pointing at the right pages; ones whose page you deleted are dropped.
@@ -153,7 +153,7 @@ different one from `python` in a terminal, so it may ask to install the componen
 - **Page numbers, headers, typed text or watermark show "?" for some characters:** they use the
   standard Helvetica font built into every PDF reader, which covers Western European letters only.
 - **Edited text came out in a different font:** the PDF only contained the letters it originally
-  used, and the font isn't installed on this computer (or its licence forbids embedding), so the
+  used, and the font isn't installed on this computer (or its license forbids embedding), so the
   closest standard font was used. Installing the font and editing again uses it.
 - **"Signer's identity is unknown" in Acrobat:** the signature was made with a self-signed
   certificate. The document is still protected against changes; to prove identity, use a certificate
@@ -174,7 +174,7 @@ Built on [pikepdf](https://github.com/pikepdf/pikepdf) / [qpdf](https://github.c
 [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / [PDFium](https://pdfium.googlesource.com/pdfium/),
 [pyHanko](https://github.com/MatthiasValvekens/pyHanko) (certificate signatures) and
 [fontTools](https://github.com/fonttools/fonttools) (font subsetting), all under
-permissive licences (MPL-2.0, Apache-2.0, BSD, MIT).
+permissive licenses (MPL-2.0, Apache-2.0, BSD, MIT).
 
 ## Support this project
 This app is free, with no ads, accounts or limits. If it saved you time or a subscription, you can

@@ -62,9 +62,9 @@ COMPRESSION = {
     "Strong — smallest file": dict(max_side=1200, quality=50),
 }
 NUMBER_FORMATS = ["1", "Page 1", "Page 1 of 9", "1 / 9"]
-NUMBER_PLACES = ["Bottom centre", "Bottom right", "Top right"]
+NUMBER_PLACES = ["Bottom center", "Bottom right", "Top right"]
 IMAGE_PAGE_SIZES = ["Same size as the image", "A4", "Letter"]
-HF_ALIGN = ["Left", "Centre", "Right"]
+HF_ALIGN = ["Left", "Center", "Right"]
 HF_TOKENS = "{page}, {pages}, {date}, {file}, {bates}"
 PAPER = {"A4": (595.28, 841.89), "Letter": (612.0, 792.0)}
 IMAGE_DPI = 150  # page size for images without (sensible) DPI information
@@ -73,7 +73,7 @@ IMAGE_DPI = 150  # page size for images without (sensible) DPI information
 RENDER_PX = 300
 PAD = 16
 
-# Look and feel (the Offline Toolkit's colours): a dark purple app bar, a light tools panel,
+# Look and feel (the Offline Toolkit's colors): a dark purple app bar, a light tools panel,
 # pages on a soft lavender desk, blue actions.
 _FAMILY = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans"
 UI = dict(
@@ -87,7 +87,7 @@ UI = dict(
     bar_text="#ddd5f5", bar_dim="#c4b8ea", bar_label="#d6ccf5",
 )
 
-# Helvetica character widths (1/1000 em) for ASCII 32-126, for centring stamps.
+# Helvetica character widths (1/1000 em) for ASCII 32-126, for centering stamps.
 HELVETICA = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278] + [556] * 10 + [
     278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
     667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556,
@@ -281,7 +281,7 @@ def inherited(page_obj, key, default=None):
 def compress_images(pdf, max_side, quality, check_cancel):
     """Re-encode the images inside the PDF as JPEG (shrunk to max_side pixels),
     keeping each new version only if it's smaller. Images that JPEG can't hold
-    faithfully (masks, 1-bit scans, CMYK, palettes, special colour spaces) are left alone."""
+    faithfully (masks, 1-bit scans, CMYK, palettes, special color spaces) are left alone."""
     seen, saved, changed = set(), 0, 0
     for page in pdf.pages:
         check_cancel()
@@ -332,8 +332,8 @@ def text_width(text, size):
     return sum(HELVETICA[ord(c) - 32] if 32 <= ord(c) < 127 else 556 for c in text) * size / 1000
 
 
-def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None, header=None, footer=None,
-                align="Centre", bates=None, first_number=0, file_stem=""):
+def stamp_pages(pdf, numbers=None, place="Bottom center", watermark=None, header=None, footer=None,
+                align="Center", bates=None, first_number=0, file_stem=""):
     """Add page numbers, a header and footer, and/or a diagonal watermark, upright as
     each page is shown (whatever its rotation), in the standard Helvetica font (no font
     is embedded). In headers and footers {page} {pages} {date} {file} {bates} are filled
@@ -356,7 +356,7 @@ def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None, header
             size = min(W, H) / max(6, len(watermark) * 0.62)
             tw = text_width(watermark, size)
             c, s = math.cos(math.radians(35)), math.sin(math.radians(35))
-            # centre the text on the page, turned 35°
+            # center the text on the page, turned 35°
             tx = W / 2 - (tw / 2) * c + (size * 0.35) * s
             ty = H / 2 - (tw / 2) * s - (size * 0.35) * c
             ops.append(f"q /TKGS gs 0.6 0 0 rg BT /TKHelv {size:.2f} Tf {c:.4f} {s:.4f} {-s:.4f} {c:.4f} "
@@ -368,7 +368,7 @@ def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None, header
             text = (numbers.replace("9", str(total)).replace("1", str(i + 1), 1)
                     if numbers != "1" else str(i + 1))
             tw = text_width(text, size)
-            tx = {"Bottom centre": W / 2 - tw / 2, "Bottom right": W - margin - tw, "Top right": W - margin - tw}[place]
+            tx = {"Bottom center": W / 2 - tw / 2, "Bottom right": W - margin - tw, "Top right": W - margin - tw}[place]
             ty = H - margin - size if place == "Top right" else margin
             lines.append((text, tx, ty))
         for text, top in ((header, True), (footer, False)):
@@ -378,10 +378,10 @@ def stamp_pages(pdf, numbers=None, place="Bottom centre", watermark=None, header
             text = (text.replace("{page}", str(i + 1)).replace("{pages}", str(total)).replace("{date}", today)
                     .replace("{file}", file_stem).replace("{bates}", b))
             tw = text_width(text, size)
-            tx = {"Left": margin, "Centre": W / 2 - tw / 2, "Right": W - margin - tw}[align]
+            tx = {"Left": margin, "Center": W / 2 - tw / 2, "Right": W - margin - tw}[align]
             # Leave room for page numbers in the same corner.
             ty = (H - margin - size) if top else (margin + (14 if numbers and place != "Top right" and align ==
-                                                             {"Bottom centre": "Centre", "Bottom right": "Right"}.get(place) else 0))
+                                                             {"Bottom center": "Center", "Bottom right": "Right"}.get(place) else 0))
             lines.append((text, tx, ty))
         for text, tx, ty in lines:
             ops.append(f"BT 0 g /TKHelv {size} Tf {tx:.2f} {ty:.2f} Td ")
@@ -632,7 +632,7 @@ def copy_bookmarks(out, used, opened, docs):
 
 
 # ---- placed text, marks and signatures -------------------------------------- #
-INK = (16, 24, 40)  # the colour of drawn and typed signatures
+INK = (16, 24, 40)  # the color of drawn and typed signatures
 SIG_DIR = os.path.join(os.path.expanduser("~"), ".pdf-toolkit")
 
 
@@ -864,7 +864,7 @@ def comment_annotation(pdf, m, box):
                f"{x + 4:.2f} {y - 13:.2f} m {x + 16:.2f} {y - 13:.2f} l S")
         ap = _form_xobject(pdf, ops, rect)
     elif kind == "box":
-        # A text box: like placed text, but with a coloured border.
+        # A text box: like placed text, but with a colored border.
         w, h = mark_size(m)
         w, h = w + 8, h + 6
         a, b, c, d, _, _ = shown_matrix(box, m["rot"])
@@ -1419,7 +1419,7 @@ def glyph_char(name):
 def read_page_content(pdf, page):
     """Interpret a page's operators. Returns (ops, glyphs, images, fonts):
     each glyph is a dict with the op index, character, its baseline start and end
-    (page coordinates), size, font resource name and fill colour; each image is a
+    (page coordinates), size, font resource name and fill color; each image is a
     dict with the op index, resource name and the matrix placing its unit square."""
     ops = list(pikepdf.parse_content_stream(page))
     res = page.obj.get("/Resources", pikepdf.Dictionary())
@@ -1924,7 +1924,7 @@ def _cp1252_ok(text):
 
 
 def system_fonts():
-    """Installed TrueType fonts: {normalised PostScript name or family+style: (path, index)}.
+    """Installed TrueType fonts: {normalized PostScript name or family+style: (path, index)}.
     Scanned once (reading only each font's name table)."""
     global _SYS_FONTS
     if _SYS_FONTS is not None:
@@ -2005,7 +2005,7 @@ def _winansi_tounicode():
 def embed_system_font(pdf, base, text):
     """Embed just the letters `text` needs from the installed font matching `base`.
     Returns (font dictionary, {char: width in em}, PostScript name), or None if
-    there's no matching font or its licence doesn't allow embedding."""
+    there's no matching font or its license doesn't allow embedding."""
     hit = find_system_font(base)
     if hit is None:
         return None
@@ -2018,7 +2018,7 @@ def embed_system_font(pdf, base, text):
         font = TTFont(hit[0], fontNumber=hit[1])
         fs_type = font["OS/2"].fsType if "OS/2" in font else 0
         if fs_type & 0x0002 or fs_type & 0x0200:
-            return None  # "restricted licence" or "bitmap only": embedding not allowed
+            return None  # "restricted license" or "bitmap only": embedding not allowed
         upm = font["head"].unitsPerEm
         opts = subset.Options()
         opts.layout_features = []
@@ -2228,7 +2228,7 @@ class ToolkitApp:
             "image_size": tk.StringVar(value=IMAGE_PAGE_SIZES[0]),
             "header": tk.StringVar(value=""),
             "footer": tk.StringVar(value=""),
-            "hf_align": tk.StringVar(value="Centre"),
+            "hf_align": tk.StringVar(value="Center"),
             "bates_prefix": tk.StringVar(value=""),
             "bates_start": tk.StringVar(value="1"),
             "bates_digits": tk.StringVar(value="6"),
@@ -2659,7 +2659,7 @@ class ToolkitApp:
     def _cell(self, k):
         _, cw, ch = self._metrics()
         cols = self._cols()
-        x0 = max(PAD, (self.canvas.winfo_width() - cols * cw) // 2)  # centre the grid
+        x0 = max(PAD, (self.canvas.winfo_width() - cols * cw) // 2)  # center the grid
         return x0 + (k % cols) * cw, PAD + (k // cols) * ch
 
     def _redraw(self):
@@ -3523,7 +3523,7 @@ class ToolkitApp:
             compress_images(out, o["compress"]["max_side"], o["compress"]["quality"], check_cancel)
         if o["numbers"] or o["watermark"] or o.get("header") or o.get("footer"):
             stamp_pages(out, o["numbers"], o["place"], o["watermark"], o.get("header"), o.get("footer"),
-                        o.get("align", "Centre"), o.get("bates"), first_number, file_stem)
+                        o.get("align", "Center"), o.get("bates"), first_number, file_stem)
         return out
 
     def _run_save(self, jobs, o, mark_clean=False, open_after=False):
@@ -3569,7 +3569,7 @@ class ToolkitApp:
                     written.append(path)
                 self.ui(lambda: self._saved(written, jobs, mark_clean, open_after))
             except Cancelled:
-                self.ui(lambda: self._save_failed("Cancelled." + (f" {len(written)} file(s) were saved." if written else "")))
+                self.ui(lambda: self._save_failed("Canceled." + (f" {len(written)} file(s) were saved." if written else "")))
             except Exception as e:
                 log_error(f"Save: {type(e).__name__}: {e}")
                 self.ui(lambda e=e: self._save_failed(f"Couldn't save: {explain_error(e)}", error=True))
@@ -3642,7 +3642,7 @@ class ToolkitApp:
                 self.ui(lambda: (self._set_busy(False), self._status(
                     f"Exported {len(written)} image{'s' * (len(written) != 1)} at {dpi} DPI."), reveal_file(written[0])))
             except Cancelled:
-                self.ui(lambda: self._save_failed(f"Cancelled. {len(written)} image(s) were saved."))
+                self.ui(lambda: self._save_failed(f"Canceled. {len(written)} image(s) were saved."))
             except Exception as e:
                 log_error(f"Export: {type(e).__name__}: {e}")
                 self.ui(lambda e=e: self._save_failed(f"Couldn't export: {explain_error(e)}", error=True))
@@ -4368,7 +4368,7 @@ class PageEditor:
         self.canvas.config(cursor="xterm" if (self.mode == "view" or tool in text_tools) else "crosshair" if tool else "")
         hints = {
             ("view", None): "",
-            ("comment", None): "Pick a tool and a colour. Click a comment to select it; drag to move it.",
+            ("comment", None): "Pick a tool and a color. Click a comment to select it; drag to move it.",
             ("comment", "highlight"): "Drag across the text to highlight.", ("comment", "underline"): "Drag across the text to underline.",
             ("comment", "strike"): "Drag across the text to strike it through.", ("comment", "note"): "Click where the note goes.",
             ("comment", "box"): "Click where the text box starts, then type.", ("comment", "rect"): "Drag to draw a rectangle.",
@@ -4392,8 +4392,8 @@ class PageEditor:
         self.color = name
         for n, sw in self.swatches.items():
             sw.config(highlightbackground=UI["text"] if n == name else UI["toolbar"])
-        # With a tool picked, the colour is for the next comment; with none, it
-        # recolours the selected one.
+        # With a tool picked, the color is for the next comment; with none, it
+        # recolors the selected one.
         m = self.selected_mark() if not self.tool else None
         if m and m["kind"] in COMMENT_KINDS:
             m["color"] = COMMENT_COLORS[name]
@@ -4452,7 +4452,7 @@ class PageEditor:
         highlights = [m for m in self.app.marks.get(p["uid"], []) if m["kind"] == "highlight"]
         if highlights:
             # Blend highlights into the page itself (like a real marker), so the
-            # colour is true and the text under it stays crisp.
+            # color is true and the text under it stays crisp.
             from PIL import ImageChops, ImageDraw
             layer = Image.new("RGB", im.size, "white")
             d = ImageDraw.Draw(layer)
@@ -4786,7 +4786,7 @@ class PageEditor:
         if kind in TEXT_MARKUP:
             for rect in m["rects"]:
                 x0, y0, x1, y1 = self.canvas_rect(rect)
-                if kind == "highlight":  # the colour is blended into the page in show(); this is for clicking
+                if kind == "highlight":  # the color is blended into the page in show(); this is for clicking
                     c.create_rectangle(x0, y0, x1, y1, fill="", outline="", tags=tag)
                 else:
                     y = y1 - (y1 - y0) * 0.08 if kind == "underline" else (y0 + y1) / 2
@@ -4991,7 +4991,7 @@ class PageEditor:
             self.app.marks[self.page()["uid"]] = [x for x in self.marks() if x["id"] != m["id"]]
             return
         m["text"] = text
-        if new:  # placed at the click as its left edge: centre it from there
+        if new:  # placed at the click as its left edge: center it from there
             w = text_width(text, m["size"]) * self.s
             m["x"], m["y"] = self.from_canvas(x0 + w / 2 + 1, cy)
         self.draw_mark(m)
@@ -5773,7 +5773,7 @@ class CompareWindow:
         if r["status"] in ("added page", "removed page"):
             t.insert("end", f"This whole page was {r['status'].split()[0]}.")
         elif not r["words"]:
-            t.insert("end", "No text changes." + (" Something else changed (pictures, layout or colours): "
+            t.insert("end", "No text changes." + (" Something else changed (pictures, layout or colors): "
                                                    "see the red boxes." if r["boxes"] else ""))
         for kind, words in r["words"]:
             t.insert("end", ("− " if kind == "removed" else "+ "), kind)
@@ -5782,7 +5782,7 @@ class CompareWindow:
 
 
 def center_over(win, root):
-    """Open a window centred over the main one (it could otherwise land on
+    """Open a window centered over the main one (it could otherwise land on
     another monitor, or off screen)."""
     win.withdraw()
     win.update_idletasks()
@@ -5848,7 +5848,7 @@ def self_test():
         out = pikepdf.new()
         out.pages.extend([a.pages[0], b.pages[0]])
         compress_images(out, 400, 60, lambda: None)
-        stamp_pages(out, "Page 1 of 9", "Bottom centre", "TEST")
+        stamp_pages(out, "Page 1 of 9", "Bottom center", "TEST")
         buf = io.BytesIO()
         out.save(buf, encryption=pikepdf.Encryption(user="pw", owner="pw", R=6))
         doc = pdfium.PdfDocument(buf.getvalue(), password="pw")
